@@ -1,0 +1,65 @@
+const std = @import("std");
+const hotpath = @import("hotpath");
+
+fn busyLoop(iterations: usize) u64 {
+    var checksum: u64 = 0;
+    var index: usize = 0;
+
+    while (index < iterations) : (index += 1) {
+        checksum +%= @as(u64, @intCast(index *% 17));
+    }
+
+    return checksum;
+}
+
+fn allocationWork(allocator: std.mem.Allocator, size: usize) !u64 {
+    var buffer = try allocator.alloc(u8, size);
+    defer allocator.free(buffer);
+
+    var index: usize = 0;
+    while (index < buffer.len) : (index += 1) {
+        buffer[index] = @intCast(index % 251);
+    }
+
+    var checksum: u64 = 0;
+    for (buffer) |byte| {
+        checksum +%= byte;
+    }
+
+    return checksum;
+}
+
+pub fn main() !void {
+    var profiler = hotpath.Profiler.init(std.heap.page_allocator);
+    defer profiler.deinit();
+
+    const tracked_allocator = profiler.allocator();
+
+    var run_index: usize = 0;
+    while (run_index < 2_000) : (run_index += 1) {
+        {
+            var zone = profiler.zone("busy-loop");
+            defer zone.end();
+            _ = busyLoop(600 + run_index);
+        }
+
+        {
+            var zone = profiler.zone("alloc-work");
+            defer zone.end();
+            _ = try allocationWork(tracked_allocator, 128 + (run_index % 128));
+        }
+    }
+
+    const checksum = hotpath.measureCall(&profiler, "single-call", busyLoop, .{80_000});
+    _ = try hotpath.measureCall(&profiler, "alloc-single-call", allocationWork, .{ tracked_allocator, @as(usize, 24_000) });
+
+    _ = hotpath.measureBlock(&profiler, "custom-block", struct {
+        fn run() u64 {
+            return busyLoop(40_000);
+        }
+    }.run);
+
+    std.debug.print("snitch enabled: {any}, checksum: {d}\n", .{ hotpath.enabled, checksum });
+
+    try hotpath.writeReportStdout(&profiler, 4_096);
+}
