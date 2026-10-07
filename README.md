@@ -4,6 +4,45 @@ A small profiler for Zig 0.17, inspired by [pawurb/hotpath-rs](https://github.co
 
 Instrumentation calls stay in your code permanently, and a build flag decides whether they do anything. With snitch off, every call is inlined to a no-op. With snitch on, it records execution time and allocations per zone and prints a sorted report.
 
+## Installation
+
+### With the package manager
+
+```sh
+zig fetch --save git+https://github.com/Uzaaft/snitch
+```
+
+```zig
+// build.zig
+const snitch_dep = b.dependency("snitch", .{
+    .target = target,
+    .optimize = optimize,
+    .snitch = b.option(bool, "snitch", "Enable profiling") orelse false,
+});
+exe.root_module.addImport("snitch", snitch_dep.module("snitch"));
+
+// Optional: adds `zig build snitch-layout`, see "Struct layout" below.
+@import("snitch").addLayoutStep(b, exe.root_module);
+```
+
+Forward `snitch-timing` and `snitch-memory` the same way if you want them as flags in your build, for example `.@"snitch-timing" = b.option(bool, "snitch-timing", "Enable timing metrics") orelse true`.
+
+### By copying the file
+
+Copy `src/snitch.zig` into your project and import it with `@import("snitch.zig")`. It reads its settings from a `build_options` module, which your `build.zig` provides:
+
+```zig
+// build.zig
+const options = b.addOptions();
+options.addOption(bool, "snitch", b.option(bool, "snitch", "Enable profiling") orelse false);
+options.addOption(bool, "snitch_timing", true);
+options.addOption(bool, "snitch_memory", true);
+exe.root_module.addImport("build_options", options.createModule());
+
+// Optional: adds `zig build snitch-layout`, see "Struct layout" below.
+@import("src/snitch.zig").addLayoutStep(b, exe.root_module);
+```
+
 ## Usage
 
 Start the process-wide profiler once in `main`. `finish` prints the report to stderr when `main` returns.
@@ -70,20 +109,6 @@ try profiler.printReport(.{}); // or profiler.writeReport(writer, .{})
 
 The timing and memory flags only matter when `-Dsnitch=true`.
 
-## Using snitch as a dependency
-
-```zig
-const snitch_dep = b.dependency("snitch", .{
-    .target = target,
-    .optimize = optimize,
-    .snitch = b.option(bool, "snitch", "Enable profiling") orelse false,
-    .@"snitch-timing" = b.option(bool, "snitch-timing", "Enable timing metrics") orelse true,
-    .@"snitch-memory" = b.option(bool, "snitch-memory", "Enable memory metrics") orelse true,
-});
-
-exe.root_module.addImport("snitch", snitch_dep.module("snitch"));
-```
-
 ## The report
 
 ```
@@ -119,18 +144,7 @@ If snitch is on but both metric groups are off, the report says so instead of pr
 
 ## Struct layout
 
-A separate build step prints the memory layout of every struct and union in the files or folders you choose, including private and nested ones. It needs no changes to your code, and your program is never modified. Add it to `build.zig`:
-
-```zig
-const snitch = @import("src/snitch.zig");
-
-pub fn build(b: *std.Build) void {
-    // ...
-    snitch.addLayoutStep(b, exe.root_module);
-}
-```
-
-Then pass files or folders, relative to the build root:
+A separate build step prints the memory layout of every struct and union in the files or folders you choose, including private and nested ones. It needs no changes to your code, and your program is never modified. Add it to `build.zig` with `addLayoutStep`, as shown under Installation, then pass files or folders, relative to the build root:
 
 ```sh
 zig build snitch-layout -Dsnitch-layout=src/model.zig,src/net

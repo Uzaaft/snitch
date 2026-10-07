@@ -1,6 +1,14 @@
 const std = @import("std");
 const snitch_build = @import("src/snitch.zig");
 
+/// For projects that depend on snitch through `build.zig.zon`: adds
+/// `zig build snitch-layout` for `module`. See `addLayoutStep` in
+/// `src/snitch.zig`.
+pub fn addLayoutStep(b: *std.Build, module: *std.Build.Module) void {
+    const package = b.dependencyFromBuildZig(@This(), .{});
+    snitch_build.addLayoutStepFrom(b, module, package.path("src/snitch.zig"));
+}
+
 const Config = struct {
     enabled: bool,
     timing_enabled: bool = true,

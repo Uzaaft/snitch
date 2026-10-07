@@ -1080,6 +1080,13 @@ const layout_decl_name = "@\"snitch.layout_types\"";
 /// probe against the copy. The program itself is never modified. Types made by
 /// generic functions and types declared inside function bodies are skipped.
 pub fn addLayoutStep(b: *std.Build, module: *std.Build.Module) void {
+    addLayoutStepFrom(b, module, b.path(@src().file));
+}
+
+/// Like `addLayoutStep`, with `source` as the path of this file. Use it when
+/// snitch is not part of the calling build's own sources; the `build.zig` of
+/// the snitch package does this for projects that depend on it.
+pub fn addLayoutStepFrom(b: *std.Build, module: *std.Build.Module, source: std.Build.LazyPath) void {
     const step = b.step("snitch-layout", "Print struct layouts for the files or folders in -Dsnitch-layout");
     const targets = b.option(
         []const u8,
@@ -1091,16 +1098,15 @@ pub fn addLayoutStep(b: *std.Build, module: *std.Build.Module) void {
     };
 
     const root_source = module.root_source_file orelse @panic("snitch.addLayoutStep: the module has no root source file");
-    const root_path = switch (root_source) {
-        .src_path => |src| src.sub_path,
+    const root_dir = switch (root_source) {
+        .src_path => |src| src.owner.path(std.fs.path.dirname(src.sub_path) orelse "."),
         else => @panic("snitch.addLayoutStep: the module's root must be a source file in the project"),
     };
-    const self_path = @src().file;
 
     const generator = b.addExecutable(.{
         .name = "snitch-layout-generator",
         .root_module = b.createModule(.{
-            .root_source_file = b.path(self_path),
+            .root_source_file = source,
             .target = b.graph.host,
             .optimize = .Debug,
         }),
@@ -1110,9 +1116,9 @@ pub fn addLayoutStep(b: *std.Build, module: *std.Build.Module) void {
     // every time; it is fast, and the probe compile below is cached by content.
     generate.has_side_effects = true;
     generate.setCwd(b.path("."));
-    generate.addArg(std.fs.path.dirname(root_path) orelse ".");
+    generate.addDirectoryArg(root_dir);
     const generated = generate.addOutputDirectoryArg("snitch-layout");
-    generate.addArg(self_path);
+    generate.addFileArg(source);
     var target_iterator = std.mem.tokenizeScalar(u8, targets, ',');
     while (target_iterator.next()) |target| {
         generate.addArg(std.mem.trim(u8, target, " "));
@@ -1130,19 +1136,31 @@ pub fn addLayoutStep(b: *std.Build, module: *std.Build.Module) void {
         probe_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
         // A file can only belong to one module, so reuse the module that
         // already wraps this file instead of creating a second one.
-        if (entry.value_ptr.*.root_source_file) |source| switch (source) {
-            .src_path => |src| if (std.mem.eql(u8, src.sub_path, self_path)) {
-                layout_module = entry.value_ptr.*;
-            },
-            else => {},
-        };
+        if (entry.value_ptr.*.root_source_file) |imported| {
+            if (sameSourceFile(imported, source)) layout_module = entry.value_ptr.*;
+        }
     }
-    probe_module.addImport("snitch_layout", layout_module orelse b.createModule(.{
-        .root_source_file = b.path(self_path),
-    }));
+    probe_module.addImport("snitch_layout", layout_module orelse b.createModule(.{ .root_source_file = source }));
 
     const probe = b.addExecutable(.{ .name = "snitch-layout", .root_module = probe_module });
     step.dependOn(&b.addRunArtifact(probe).step);
+}
+
+/// Whether two source paths name the same file in the same package. Separate
+/// instances of one dependency share a package hash, so compare that rather
+/// than the owning `Build`.
+fn sameSourceFile(a: std.Build.LazyPath, b: std.Build.LazyPath) bool {
+    const a_key = sourceKey(a) orelse return false;
+    const b_key = sourceKey(b) orelse return false;
+    return std.mem.eql(u8, a_key[0], b_key[0]) and std.mem.eql(u8, a_key[1], b_key[1]);
+}
+
+fn sourceKey(path: std.Build.LazyPath) ?struct { []const u8, []const u8 } {
+    return switch (path) {
+        .src_path => |src| .{ src.owner.pkg_hash, src.sub_path },
+        .dependency => |dep| .{ dep.dependency.builder.pkg_hash, dep.sub_path },
+        else => null,
+    };
 }
 
 /// Entry point of the layout generator that `addLayoutStep` builds from this
