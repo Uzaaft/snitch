@@ -8,7 +8,6 @@
 //! - `-Dsnitch`: master switch (default `false`).
 //! - `-Dsnitch-timing`: record execution time (default `true`).
 //! - `-Dsnitch-memory`: record allocations (default `true`).
-//! - `-Dsnitch-max-rows`: rows per report section, `0` for all (default `0`).
 //!
 //! # Notes
 //!
@@ -30,7 +29,7 @@
 //!
 //! pub fn main(init: std.process.Init) !void {
 //!     snitch.start(init.io, init.gpa);
-//!     defer snitch.finish(); // prints the report to stderr
+//!     defer snitch.finish(.{}); // prints the report to stderr
 //!
 //!     {
 //!         var zone = snitch.zone("db-query");
@@ -60,8 +59,11 @@ pub const timing_enabled = enabled and build_options.snitch_timing;
 /// True when snitch is enabled and memory metrics are on.
 pub const memory_enabled = enabled and build_options.snitch_memory;
 
-/// Maximum rows printed per section, set via `-Dsnitch-max-rows`.
-pub const report_max_rows = build_options.snitch_max_rows;
+/// How a report is laid out.
+pub const ReportOptions = struct {
+    /// Rows per table, sorted by total; `0` shows every zone.
+    max_rows: usize = 0,
+};
 
 /// Upper bound on distinct zone labels in one program.
 const max_labels = 1024;
@@ -418,19 +420,19 @@ pub const Profiler = struct {
     }
 
     /// Write the report to stderr.
-    pub fn printReport(self: *Profiler) callconv(callingConvention()) !void {
+    pub fn printReport(self: *Profiler, options: ReportOptions) callconv(callingConvention()) !void {
         if (comptime !enabled) {
             return;
         }
 
         var buffer: [4_096]u8 = undefined;
         var stderr_writer = std.Io.File.stderr().writer(self.io, &buffer);
-        try self.writeReport(&stderr_writer.interface);
+        try self.writeReport(&stderr_writer.interface, options);
         try stderr_writer.interface.flush();
     }
 
     /// Write the report as ASCII tables.
-    pub fn writeReport(self: *Profiler, writer: *std.Io.Writer) callconv(callingConvention()) !void {
+    pub fn writeReport(self: *Profiler, writer: *std.Io.Writer, options: ReportOptions) callconv(callingConvention()) !void {
         if (comptime !enabled) {
             return;
         }
@@ -446,7 +448,7 @@ pub const Profiler = struct {
             entry_count += 1;
         }
 
-        try writeReportEntries(self.base_allocator, writer, entries[0..entry_count]);
+        try writeReportEntries(self.base_allocator, writer, entries[0..entry_count], options);
     }
 
     /// Slot for a label index, created on first use. Racing threads may
@@ -582,7 +584,12 @@ const cell_capacity = max_label_width;
 const timing_columns = [_][]const u8{ "Zone", "Calls", "Avg", "P50", "P95", "P99", "Max", "Total", "% Total" };
 const memory_columns = [_][]const u8{ "Zone", "Calls", "Avg", "P50", "P95", "P99", "Max", "Total", "Allocs/call", "% Total" };
 
-fn writeReportEntries(gpa: std.mem.Allocator, writer: *std.Io.Writer, entries: []const LabeledSlot) !void {
+fn writeReportEntries(
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    entries: []const LabeledSlot,
+    options: ReportOptions,
+) !void {
     try writer.print("[snitch] {d} zone{s}\n", .{ entries.len, if (entries.len == 1) "" else "s" });
 
     if (entries.len == 0) {
@@ -602,7 +609,7 @@ fn writeReportEntries(gpa: std.mem.Allocator, writer: *std.Io.Writer, entries: [
             row.* = .fromHistogram(entry.label, &entry.slot.timing);
         }
         try writer.writeAll("\nTiming per call\n");
-        try writeTable(writer, .time, &timing_columns, rows);
+        try writeTable(writer, .time, &timing_columns, rows, options);
     }
 
     if (memory_enabled) {
@@ -621,18 +628,24 @@ fn writeReportEntries(gpa: std.mem.Allocator, writer: *std.Io.Writer, entries: [
         if (allocating == 0) {
             try writer.writeAll("(no zone allocated through the tracked allocator)\n");
         } else {
-            try writeTable(writer, .bytes, &memory_columns, rows[0..allocating]);
+            try writeTable(writer, .bytes, &memory_columns, rows[0..allocating], options);
         }
     }
 }
 
-fn writeTable(writer: *std.Io.Writer, comptime unit: Unit, comptime header: []const []const u8, rows: []Row) !void {
+fn writeTable(
+    writer: *std.Io.Writer,
+    comptime unit: Unit,
+    comptime header: []const []const u8,
+    rows: []Row,
+    options: ReportOptions,
+) !void {
     const column_count = header.len;
     const Cells = [column_count][]const u8;
     const Buffers = [column_count][cell_capacity]u8;
 
     std.sort.pdq(Row, rows, {}, Row.moreTotalFirst);
-    const visible = if (report_max_rows == 0) rows else rows[0..@min(rows.len, report_max_rows)];
+    const visible = if (options.max_rows == 0) rows else rows[0..@min(rows.len, options.max_rows)];
 
     var grand_total: u128 = 0;
     for (rows) |row| {
@@ -662,7 +675,7 @@ fn writeTable(writer: *std.Io.Writer, comptime unit: Unit, comptime header: []co
 
     if (visible.len < rows.len) {
         try writer.print(
-            "(showing {d} of {d} zones; build with -Dsnitch-max-rows=0 to show all)\n",
+            "(showing the top {d} of {d} zones)\n",
             .{ visible.len, rows.len },
         );
     }
@@ -806,12 +819,12 @@ pub fn start(io: std.Io, base_allocator: std.mem.Allocator) callconv(callingConv
 
 /// Print the process-wide profiler's report to stderr, then free it. Call it
 /// after every zone has ended, typically with `defer` right after `start`.
-pub fn finish() callconv(callingConvention()) void {
+pub fn finish(options: ReportOptions) callconv(callingConvention()) void {
     if (!default_started.load(.acquire)) {
         return;
     }
 
-    default_profiler.printReport() catch {};
+    default_profiler.printReport(options) catch {};
     stop();
 }
 

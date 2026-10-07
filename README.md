@@ -18,7 +18,7 @@ fn handler(id: usize) u64 {
 
 pub fn main(init: std.process.Init) !void {
     snitch.start(init.io, init.gpa);
-    defer snitch.finish();
+    defer snitch.finish(.{});
 
     {
         var zone = snitch.zone("db-query");
@@ -56,7 +56,7 @@ var zone = profiler.zone("db-query");
 zone.end();
 _ = profiler.measureCall("handler", handler, .{@as(usize, 5)});
 
-try profiler.printReport(); // or profiler.writeReport(writer)
+try profiler.printReport(.{}); // or profiler.writeReport(writer, .{})
 ```
 
 ## Build flags
@@ -66,7 +66,6 @@ try profiler.printReport(); // or profiler.writeReport(writer)
 | `-Dsnitch` | `false` | Turn instrumentation on. |
 | `-Dsnitch-timing` | `true` | Record execution time. |
 | `-Dsnitch-memory` | `true` | Record allocations. |
-| `-Dsnitch-max-rows` | `0` | Rows per report section. `0` shows all rows. |
 
 The timing and memory flags only matter when `-Dsnitch=true`.
 
@@ -79,7 +78,6 @@ const snitch_dep = b.dependency("snitch", .{
     .snitch = b.option(bool, "snitch", "Enable profiling") orelse false,
     .@"snitch-timing" = b.option(bool, "snitch-timing", "Enable timing metrics") orelse true,
     .@"snitch-memory" = b.option(bool, "snitch-memory", "Enable memory metrics") orelse true,
-    .@"snitch-max-rows" = b.option(usize, "snitch-max-rows", "Max rows per report section") orelse 0,
 });
 
 exe.root_module.addImport("snitch", snitch_dep.module("snitch"));
@@ -106,7 +104,9 @@ Memory allocated per call
 +-------------+-------+-------+-------+-------+-------+-------+---------+-------------+---------+
 ```
 
-The timing table lists every zone. The memory table lists only zones that allocated through the tracked allocator. Both are sorted by `Total`, highest first. When `-Dsnitch-max-rows` is set, each table shows only its top rows and notes how many it left out.
+The timing table lists every zone. The memory table lists only zones that allocated through the tracked allocator. Both are sorted by `Total`, highest first.
+
+To show only the biggest zones, pass `.{ .max_rows = 20 }` to `finish`, `printReport` or `writeReport`. Each table then shows its top rows and notes how many it left out.
 
 Percentiles come from a fixed-size histogram per label, so memory use stays flat no matter how many times a zone runs. A percentile may read up to 1/64 (about 1.6%) above the true value; averages and totals are exact.
 

@@ -31,7 +31,7 @@ fn allocationWork(allocator: std.mem.Allocator, size: usize) !u64 {
 
 pub fn main(init: std.process.Init) !void {
     snitch.start(init.io, std.heap.page_allocator);
-    defer snitch.finish();
+    defer snitch.finish(.{});
 
     const tracked_allocator = snitch.allocator();
 

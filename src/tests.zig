@@ -16,9 +16,9 @@ fn burnCpu(iterations: usize) u64 {
     return total;
 }
 
-fn writeReportToBuffer(profiler: *snitch.Profiler, storage: []u8) ![]const u8 {
+fn writeReportToBuffer(profiler: *snitch.Profiler, storage: []u8, options: snitch.ReportOptions) ![]const u8 {
     var report_writer: std.Io.Writer = .fixed(storage);
-    try profiler.writeReport(&report_writer);
+    try profiler.writeReport(&report_writer, options);
     return report_writer.buffered();
 }
 
@@ -75,7 +75,7 @@ test "callsite helper APIs return wrapped values" {
 // Labels are checked against the timing table, which lists every zone; the
 // memory table only lists zones that allocated.
 test "callsite helper labels include file and line" {
-    if (!snitch.enabled or snitch.report_max_rows != 0) {
+    if (!snitch.enabled) {
         return;
     }
 
@@ -101,7 +101,7 @@ test "callsite helper labels include file and line" {
     zone.end();
 
     var report_storage: [4_096]u8 = undefined;
-    const report = try writeReportToBuffer(&profiler, &report_storage);
+    const report = try writeReportToBuffer(&profiler, &report_storage, .{});
 
     const call_label = std.fmt.comptimePrint("{s}:{d}", .{ call_location.file, call_location.line });
     const block_label = std.fmt.comptimePrint("{s}:{d}", .{ block_location.file, block_location.line });
@@ -148,7 +148,7 @@ test "disabled mode keeps no-op surface" {
     var zone = profiler.zone("disabled-zone");
     zone.end();
 
-    try profiler.printReport();
+    try profiler.printReport(.{});
 }
 
 test "writeReport output respects compile-time config" {
@@ -171,7 +171,7 @@ test "writeReport output respects compile-time config" {
     }
 
     var report_storage: [4_096]u8 = undefined;
-    const report = try writeReportToBuffer(&profiler, &report_storage);
+    const report = try writeReportToBuffer(&profiler, &report_storage, .{});
 
     if (!snitch.enabled) {
         try std.testing.expectEqual(@as(usize, 0), report.len);
@@ -208,7 +208,7 @@ test "writeReport output respects compile-time config" {
 }
 
 test "report max rows truncates sorted sections" {
-    if (!snitch.enabled or snitch.report_max_rows == 0) {
+    if (!snitch.enabled) {
         return;
     }
 
@@ -248,9 +248,9 @@ test "report max rows truncates sorted sections" {
     }
 
     var report_storage: [8_192]u8 = undefined;
-    const report = try writeReportToBuffer(&profiler, &report_storage);
+    const report = try writeReportToBuffer(&profiler, &report_storage, .{ .max_rows = 1 });
 
-    const truncation_note = "(showing 1 of 2 zones; build with -Dsnitch-max-rows=0 to show all)";
+    const truncation_note = "(showing the top 1 of 2 zones)";
     try std.testing.expectEqual(@as(usize, 2), countOccurrences(report, truncation_note));
     try expectContains(report, "heavy-zone");
     try expectNotContains(report, "light-zone");
@@ -282,11 +282,11 @@ test "process-wide profiler records zones between start and stop" {
 
     const profiler = snitch.defaultProfiler().?;
     var report_storage: [4_096]u8 = undefined;
-    const report = try writeReportToBuffer(profiler, &report_storage);
+    const report = try writeReportToBuffer(profiler, &report_storage, .{});
 
     try expectContains(report, "[snitch] 3 zones\n");
     try expectNotContains(report, "before-start");
-    if (snitch.timing_enabled and snitch.report_max_rows == 0) {
+    if (snitch.timing_enabled) {
         try expectContains(report, "global-zone");
         try expectContains(report, "global-call");
     }
