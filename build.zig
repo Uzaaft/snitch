@@ -1,4 +1,5 @@
 const std = @import("std");
+const snitch_build = @import("src/snitch.zig");
 
 const Config = struct {
     enabled: bool,
@@ -66,6 +67,8 @@ pub fn build(b: *std.Build) void {
     run_example.addPassthruArgs();
     const run_step = b.step("run", "Run the example program");
     run_step.dependOn(&run_example.step);
+
+    snitch_build.addLayoutStep(b, example.root_module);
 
     // Every test runs once per configuration, since most code paths are
     // selected at compile time.

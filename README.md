@@ -117,10 +117,55 @@ Recording a zone is lock-free and costs about 50 ns, most of it reading the cloc
 
 If snitch is on but both metric groups are off, the report says so instead of printing tables.
 
+## Struct layout
+
+A separate build step prints the memory layout of every struct and union in the files or folders you choose, including private and nested ones. It needs no changes to your code, and your program is never modified. Add it to `build.zig`:
+
+```zig
+const snitch = @import("src/snitch.zig");
+
+pub fn build(b: *std.Build) void {
+    // ...
+    snitch.addLayoutStep(b, exe.root_module);
+}
+```
+
+Then pass files or folders, relative to the build root:
+
+```sh
+zig build snitch-layout -Dsnitch-layout=src/model.zig,src/net
+```
+
+```
+[snitch] layout of 1 type
+
++-------------+---------------+------+-------+---------+-----------+
+| Type        | Kind          | Size | Align | Padding | Best size |
++-------------+---------------+------+-------+---------+-----------+
+| main.Header | extern struct | 40 B |     8 |    18 B |      24 B |
++-------------+---------------+------+-------+---------+-----------+
+
+main.Header
++--------------+------+--------+------+-------+---------------+
+| Field        | Type | Offset | Size | Align | Padding after |
++--------------+------+--------+------+-------+---------------+
+| is_retry     | bool |      0 |  1 B |     1 |           7 B |
+| sequence     | u64  |      8 |  8 B |     8 |               |
+| kind         | u8   |     16 |  1 B |     1 |           7 B |
+| timestamp_ns | u64  |     24 |  8 B |     8 |               |
+| length       | u32  |     32 |  4 B |     4 |           4 B |
++--------------+------+--------+------+-------+---------------+
+```
+
+Types are sorted by padding, and types with padding get a field-by-field breakdown. `Best size` is the size with fields ordered by alignment. It is only shown for `extern` structs: Zig already reorders the fields of ordinary structs, so their padding is usually just what alignment requires at the end.
+
+The step copies the module's sources into the build cache, appends a list of the found types to each scanned file, and compiles and runs a small probe against the copy with the module's target, optimize mode and imports. Types created by generic functions, like `ArrayList(Order)`, and types declared inside function bodies are skipped. The files must be inside the module's root folder.
+
 ## Development
 
 ```bash
 zig build run                 # run example/main.zig with snitch off
 zig build run -Dsnitch=true   # run it with snitch on
 zig build test                # run the tests in every build configuration
+zig build snitch-layout -Dsnitch-layout=example   # struct layouts in the example
 ```

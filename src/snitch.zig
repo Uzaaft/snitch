@@ -20,6 +20,8 @@
 //! - Percentiles come from a fixed-size histogram and may read up to 1/64
 //!   (about 1.6%) above the true value. Averages, totals and maxima are exact.
 //! - A program can use at most 1024 distinct zone labels.
+//! - `addLayoutStep` adds `zig build snitch-layout`, which prints the size,
+//!   alignment and padding of the structs in chosen files; see its docs.
 //!
 //! # Example
 //!
@@ -583,10 +585,17 @@ fn writeReportEntries(
 ) !void {
     try writer.print("[snitch] {d} zone{s}\n", .{ entries.len, if (entries.len == 1) "" else "s" });
 
-    if (entries.len == 0) {
-        return;
+    if (entries.len > 0) {
+        try writeZoneSections(gpa, writer, entries, options);
     }
+}
 
+fn writeZoneSections(
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    entries: []const LabeledSlot,
+    options: ReportOptions,
+) !void {
     if (!timing_enabled and !memory_enabled) {
         try writer.writeAll("Both snitch-timing and snitch-memory are disabled, so there is nothing to show.\n");
         return;
@@ -655,12 +664,12 @@ fn writeTable(
     }
 
     try writeSeparator(writer, &widths);
-    try writeRow(writer, &widths, header);
+    try writeRowCells(writer, &widths, 1, header);
     try writeSeparator(writer, &widths);
     for (visible) |row| {
         var buffers: Buffers = undefined;
         const cells: Cells = try rowCells(unit, column_count, row, grand_total, &buffers);
-        try writeRow(writer, &widths, &cells);
+        try writeRowCells(writer, &widths, 1, &cells);
     }
     try writeSeparator(writer, &widths);
 
@@ -708,10 +717,11 @@ fn writeSeparator(writer: *std.Io.Writer, widths: []const usize) !void {
     try writer.writeAll("+\n");
 }
 
-/// The zone column is left-aligned; the numeric columns are right-aligned.
-fn writeRow(writer: *std.Io.Writer, widths: []const usize, cells: []const []const u8) !void {
+/// The first `text_columns` columns are left-aligned text; the rest are
+/// right-aligned numbers.
+fn writeRowCells(writer: *std.Io.Writer, widths: []const usize, text_columns: usize, cells: []const []const u8) !void {
     for (cells, widths, 0..) |cell, width, column| {
-        if (column == 0) {
+        if (column < text_columns) {
             try writer.print("| {s:<[1]} ", .{ cell, width });
         } else {
             try writer.print("| {s:>[1]} ", .{ cell, width });
@@ -805,6 +815,530 @@ fn zoneLabel(comptime name: anytype) []const u8 {
         @compileError("zone name must not be empty");
     }
     return label;
+}
+
+// ---------------------------------------------------------------------------
+// Layout
+
+/// Memory layout of one struct or union, computed at compile time.
+const TypeLayout = struct {
+    name: []const u8,
+    kind: []const u8,
+    size: usize,
+    alignment: usize,
+    /// Bytes lost to padding, or null when it isn't meaningful (packed
+    /// structs, unions).
+    padding: ?usize,
+    /// Size with fields ordered by alignment, or null when Zig chooses the
+    /// order itself or the type is not a struct.
+    best_size: ?usize,
+    /// Runtime fields in memory order. Empty for packed structs and unions.
+    fields: []const FieldLayout,
+};
+
+const FieldLayout = struct {
+    name: []const u8,
+    type_name: []const u8,
+    offset: usize,
+    size: usize,
+    alignment: usize,
+    /// Bytes between the end of this field and the next one, or the end of
+    /// the struct.
+    padding_after: usize,
+};
+
+fn describeLayout(comptime T: type) TypeLayout {
+    return switch (@typeInfo(T)) {
+        .@"struct" => |info| describeStruct(T, info),
+        .@"union" => |info| .{
+            .name = @typeName(T),
+            .kind = if (info.tag_type != null) "tagged union" else switch (info.layout) {
+                .auto => "union",
+                .@"extern" => "extern union",
+                .@"packed" => "packed union",
+            },
+            .size = @sizeOf(T),
+            .alignment = @alignOf(T),
+            .padding = null,
+            .best_size = null,
+            .fields = &.{},
+        },
+        else => unreachable,
+    };
+}
+
+fn describeStruct(comptime T: type, comptime info: std.builtin.Type.Struct) TypeLayout {
+    if (info.layout == .@"packed") {
+        return .{
+            .name = @typeName(T),
+            .kind = "packed struct",
+            .size = @sizeOf(T),
+            .alignment = @alignOf(T),
+            .padding = null,
+            .best_size = null,
+            .fields = &.{},
+        };
+    }
+
+    var fields: [info.field_names.len]FieldLayout = undefined;
+    var count: usize = 0;
+    var field_bytes: usize = 0;
+    for (info.field_names, info.field_types, info.field_attrs) |name, Field, attrs| {
+        if (attrs.@"comptime" or @sizeOf(Field) == 0) continue;
+        fields[count] = .{
+            .name = name,
+            .type_name = @typeName(Field),
+            .offset = @offsetOf(T, name),
+            .size = @sizeOf(Field),
+            .alignment = attrs.@"align" orelse @alignOf(Field),
+            .padding_after = 0,
+        };
+        field_bytes += @sizeOf(Field);
+        count += 1;
+    }
+
+    // Zig may reorder auto-layout fields, so sort into memory order.
+    std.sort.insertion(FieldLayout, fields[0..count], {}, struct {
+        fn lessThan(_: void, lhs: FieldLayout, rhs: FieldLayout) bool {
+            return lhs.offset < rhs.offset;
+        }
+    }.lessThan);
+
+    var padding: usize = 0;
+    for (fields[0..count], 0..) |*field, index| {
+        const next_offset = if (index + 1 < count) fields[index + 1].offset else @sizeOf(T);
+        field.padding_after = next_offset - (field.offset + field.size);
+        padding += field.padding_after;
+    }
+    if (count > 0) {
+        padding += fields[0].offset;
+    }
+
+    const final = fields[0..count].*;
+    return .{
+        .name = @typeName(T),
+        .kind = if (info.layout == .@"extern") "extern struct" else "struct",
+        .size = @sizeOf(T),
+        .alignment = @alignOf(T),
+        .padding = padding,
+        // Ordering fields by descending alignment leaves padding only at the
+        // end. Zig already does this for auto layout, so only extern structs
+        // can be improved by hand.
+        .best_size = if (info.layout == .@"extern") std.mem.alignForward(usize, field_bytes, @alignOf(T)) else null,
+        .fields = &final,
+    };
+}
+
+const layout_columns = [_][]const u8{ "Type", "Kind", "Size", "Align", "Padding", "Best size" };
+const field_columns = [_][]const u8{ "Field", "Type", "Offset", "Size", "Align", "Padding after" };
+
+/// Write layout tables for `types`, a tuple of struct and union types: a
+/// summary sorted by padding, then a field-by-field breakdown of every type
+/// that has padding. `zig build snitch-layout` calls this; see `addLayoutStep`.
+pub fn writeLayouts(writer: *std.Io.Writer, comptime types: anytype) !void {
+    const layouts = comptime describeLayouts(types);
+    try writer.print("[snitch] layout of {d} type{s}\n", .{ layouts.len, if (layouts.len == 1) "" else "s" });
+    if (layouts.len == 0) {
+        return;
+    }
+
+    try writer.writeByte('\n');
+    var summary = StringTable(layout_columns.len).init(&layout_columns);
+    for (&layouts) |*item| {
+        try summary.measure(try layoutCells(item, &summary.buffers));
+    }
+    try summary.writeHeader(writer);
+    for (&layouts) |*item| {
+        try summary.writeRow(writer, try layoutCells(item, &summary.buffers));
+    }
+    try summary.writeFooter(writer);
+
+    for (&layouts) |*item| {
+        const padding = item.padding orelse continue;
+        if (padding == 0) continue;
+
+        try writer.print("\n{s}\n", .{item.name});
+        var table = StringTable(field_columns.len).init(&field_columns);
+        for (item.fields) |field| {
+            try table.measure(try fieldCells(field, &table.buffers));
+        }
+        try table.writeHeader(writer);
+        for (item.fields) |field| {
+            try table.writeRow(writer, try fieldCells(field, &table.buffers));
+        }
+        try table.writeFooter(writer);
+    }
+}
+
+/// Layouts of `types`, most padding first. Types without a meaningful
+/// padding figure (packed structs, unions) go last.
+fn describeLayouts(comptime types: anytype) [types.len]TypeLayout {
+    @setEvalBranchQuota(100_000);
+    var layouts: [types.len]TypeLayout = undefined;
+    for (&layouts, 0..) |*item, index| {
+        item.* = describeLayout(types[index]);
+    }
+
+    std.sort.insertion(TypeLayout, &layouts, {}, struct {
+        fn morePaddingFirst(_: void, lhs: TypeLayout, rhs: TypeLayout) bool {
+            const lhs_padding = lhs.padding orelse return false;
+            const rhs_padding = rhs.padding orelse return true;
+            return lhs_padding > rhs_padding;
+        }
+    }.morePaddingFirst);
+    return layouts;
+}
+
+fn layoutCells(item: *const TypeLayout, buffers: *[layout_columns.len][cell_capacity]u8) ![layout_columns.len][]const u8 {
+    return .{
+        truncateLabel(item.name, buffers[0][0..max_label_width]),
+        item.kind,
+        try formatBytes(item.size, &buffers[2]),
+        try std.fmt.bufPrint(&buffers[3], "{d}", .{item.alignment}),
+        if (item.padding) |padding| try formatBytes(padding, &buffers[4]) else "-",
+        if (item.best_size) |best_size| try formatBytes(best_size, &buffers[5]) else "-",
+    };
+}
+
+fn fieldCells(field: FieldLayout, buffers: *[field_columns.len][cell_capacity]u8) ![field_columns.len][]const u8 {
+    return .{
+        truncateLabel(field.name, buffers[0][0..max_label_width]),
+        truncateLabel(field.type_name, buffers[1][0..max_label_width]),
+        try std.fmt.bufPrint(&buffers[2], "{d}", .{field.offset}),
+        try formatBytes(field.size, &buffers[3]),
+        try std.fmt.bufPrint(&buffers[4], "{d}", .{field.alignment}),
+        if (field.padding_after == 0) "" else try formatBytes(field.padding_after, &buffers[5]),
+    };
+}
+
+/// Two-pass ASCII table of string cells: `measure` every row, then write.
+/// The first two columns are text, the rest numbers.
+fn StringTable(comptime column_count: usize) type {
+    return struct {
+        const Self = @This();
+
+        header: *const [column_count][]const u8,
+        widths: [column_count]usize,
+        buffers: [column_count][cell_capacity]u8 = undefined,
+
+        fn init(header: *const [column_count][]const u8) Self {
+            var widths: [column_count]usize = undefined;
+            for (&widths, header) |*width, cell| {
+                width.* = cell.len;
+            }
+            return .{ .header = header, .widths = widths };
+        }
+
+        fn measure(self: *Self, cells: [column_count][]const u8) !void {
+            for (&self.widths, cells) |*width, cell| {
+                width.* = @max(width.*, cell.len);
+            }
+        }
+
+        fn writeHeader(self: *Self, writer: *std.Io.Writer) !void {
+            try writeSeparator(writer, &self.widths);
+            try writeRowCells(writer, &self.widths, 2, self.header);
+            try writeSeparator(writer, &self.widths);
+        }
+
+        fn writeRow(self: *Self, writer: *std.Io.Writer, cells: [column_count][]const u8) !void {
+            try writeRowCells(writer, &self.widths, 2, &cells);
+        }
+
+        fn writeFooter(self: *Self, writer: *std.Io.Writer) !void {
+            try writeSeparator(writer, &self.widths);
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Build integration
+//
+// Everything below runs at build time. `build.zig` imports this file directly
+// to call `addLayoutStep`, and the build compiles this same file a second time
+// as the layout generator, entering through `main`.
+
+/// Name of the declaration the generator appends to each scanned file.
+const layout_decl_name = "@\"snitch.layout_types\"";
+
+/// Add `zig build snitch-layout`, which prints the memory layout of every
+/// struct and union declared in the files or folders passed with
+/// `-Dsnitch-layout`, including private and nested ones:
+///
+/// ```zig
+/// // build.zig
+/// const snitch = @import("src/snitch.zig");
+/// snitch.addLayoutStep(b, exe.root_module);
+/// ```
+///
+/// ```sh
+/// zig build snitch-layout -Dsnitch-layout=src/model.zig,src/net
+/// ```
+///
+/// The step copies the module's source tree into the build cache, appends a
+/// list of the found types to each scanned file, and compiles and runs a small
+/// probe against the copy. The program itself is never modified. Types made by
+/// generic functions and types declared inside function bodies are skipped.
+pub fn addLayoutStep(b: *std.Build, module: *std.Build.Module) void {
+    const step = b.step("snitch-layout", "Print struct layouts for the files or folders in -Dsnitch-layout");
+    const targets = b.option(
+        []const u8,
+        "snitch-layout",
+        "Comma-separated files or folders, relative to the build root, for zig build snitch-layout",
+    ) orelse {
+        step.dependOn(&b.addFail("snitch-layout needs -Dsnitch-layout=<files or folders>, e.g. -Dsnitch-layout=src/model.zig,src").step);
+        return;
+    };
+
+    const root_source = module.root_source_file orelse @panic("snitch.addLayoutStep: the module has no root source file");
+    const root_path = switch (root_source) {
+        .src_path => |src| src.sub_path,
+        else => @panic("snitch.addLayoutStep: the module's root must be a source file in the project"),
+    };
+    const self_path = @src().file;
+
+    const generator = b.addExecutable(.{
+        .name = "snitch-layout-generator",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(self_path),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const generate = b.addRunArtifact(generator);
+    // The generator reads sources the build system doesn't track, so rerun it
+    // every time; it is fast, and the probe compile below is cached by content.
+    generate.has_side_effects = true;
+    generate.setCwd(b.path("."));
+    generate.addArg(std.fs.path.dirname(root_path) orelse ".");
+    const generated = generate.addOutputDirectoryArg("snitch-layout");
+    generate.addArg(self_path);
+    var target_iterator = std.mem.tokenizeScalar(u8, targets, ',');
+    while (target_iterator.next()) |target| {
+        generate.addArg(std.mem.trim(u8, target, " "));
+    }
+
+    const probe_module = b.createModule(.{
+        .root_source_file = generated.path(b, "snitch_layout_probe.zig"),
+        .target = module.resolved_target orelse b.graph.host,
+        .optimize = module.optimize orelse .Debug,
+    });
+    // The copied sources keep their imports, so give the probe the same ones.
+    var layout_module: ?*std.Build.Module = null;
+    var imports = module.import_table.iterator();
+    while (imports.next()) |entry| {
+        probe_module.addImport(entry.key_ptr.*, entry.value_ptr.*);
+        // A file can only belong to one module, so reuse the module that
+        // already wraps this file instead of creating a second one.
+        if (entry.value_ptr.*.root_source_file) |source| switch (source) {
+            .src_path => |src| if (std.mem.eql(u8, src.sub_path, self_path)) {
+                layout_module = entry.value_ptr.*;
+            },
+            else => {},
+        };
+    }
+    probe_module.addImport("snitch_layout", layout_module orelse b.createModule(.{
+        .root_source_file = b.path(self_path),
+    }));
+
+    const probe = b.addExecutable(.{ .name = "snitch-layout", .root_module = probe_module });
+    step.dependOn(&b.addRunArtifact(probe).step);
+}
+
+/// Entry point of the layout generator that `addLayoutStep` builds from this
+/// file. Not part of the profiling API.
+///
+/// Arguments: the module's root directory, the output directory, the path of
+/// this file (never scanned), then the files or folders to scan, all relative
+/// to the working directory.
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const arena = init.arena.allocator();
+    const args = try init.minimal.args.toSlice(arena);
+    if (args.len < 5) {
+        std.debug.print("usage: {s} <module root> <output dir> <snitch.zig> <file or folder>...\n", .{args[0]});
+        return error.InvalidArguments;
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    const root_real = try cwd.realPathFileAlloc(io, args[1], arena);
+    const self_real = try cwd.realPathFileAlloc(io, args[3], arena);
+    var root = try cwd.openDir(io, args[1], .{ .iterate = true });
+    defer root.close(io);
+    var out = try cwd.createDirPathOpen(io, args[2], .{});
+    defer out.close(io);
+
+    try copyZigTree(arena, io, root, out);
+
+    var probe: std.ArrayList(u8) = .empty;
+    try probe.appendSlice(arena,
+        \\// Generated by snitch's layout step.
+        \\const std = @import("std");
+        \\
+        \\pub fn main(init: std.process.Init) !void {
+        \\    const types = .{}
+    );
+
+    for (args[4..]) |target| {
+        const target_real = cwd.realPathFileAlloc(io, target, arena) catch |err| {
+            std.debug.print("snitch-layout: cannot open {s}: {t}\n", .{ target, err });
+            return err;
+        };
+        const relative = relativeTo(root_real, target_real) orelse {
+            std.debug.print("snitch-layout: {s} is outside the module root {s}\n", .{ target, args[1] });
+            return error.OutsideModuleRoot;
+        };
+
+        for (try zigFilesAt(arena, io, root, relative)) |file_path| {
+            // Snitch's own types would only add noise.
+            const file_real = try std.fs.path.join(arena, &.{ root_real, file_path });
+            if (std.mem.eql(u8, file_real, self_real)) continue;
+
+            if (try appendLayoutDecl(arena, io, out, file_path)) {
+                try probe.print(arena, " ++ @import(\"{s}\").{s}", .{ file_path, layout_decl_name });
+            }
+        }
+    }
+
+    try probe.appendSlice(arena,
+        \\;
+        \\    var buffer: [4096]u8 = undefined;
+        \\    var stdout = std.Io.File.stdout().writer(init.io, &buffer);
+        \\    try @import("snitch_layout").writeLayouts(&stdout.interface, types);
+        \\    try stdout.interface.flush();
+        \\}
+        \\
+    );
+    try out.writeFile(io, .{ .sub_path = "snitch_layout_probe.zig", .data = probe.items });
+}
+
+/// Copy every `.zig` file under `from` to the same relative path in `to`,
+/// skipping hidden directories and `zig-out`.
+fn copyZigTree(arena: std.mem.Allocator, io: std.Io, from: std.Io.Dir, to: std.Io.Dir) !void {
+    var walker = try from.walkSelectively(arena);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        switch (entry.kind) {
+            .directory => if (entry.basename[0] != '.' and !std.mem.eql(u8, entry.basename, "zig-out")) {
+                try walker.enter(io, entry);
+            },
+            .file => if (std.mem.endsWith(u8, entry.basename, ".zig")) {
+                const data = try from.readFileAlloc(io, entry.path, arena, .unlimited);
+                if (std.fs.path.dirname(entry.path)) |dir| {
+                    try to.createDirPath(io, dir);
+                }
+                try to.writeFile(io, .{ .sub_path = entry.path, .data = data });
+            },
+            else => {},
+        }
+    }
+}
+
+/// `path` relative to `root`, or null if it lies outside it. Both must be
+/// real paths.
+fn relativeTo(root: []const u8, path: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, root, path)) return ".";
+    if (!std.mem.startsWith(u8, path, root) or path[root.len] != std.fs.path.sep) return null;
+    return path[root.len + 1 ..];
+}
+
+/// `.zig` files at `relative` inside `root`: the file itself, or every file in
+/// the folder and its subfolders. Paths use `/` so they work in `@import`.
+fn zigFilesAt(arena: std.mem.Allocator, io: std.Io, root: std.Io.Dir, relative: []const u8) ![]const []const u8 {
+    var files: std.ArrayList([]const u8) = .empty;
+    var dir = root.openDir(io, relative, .{ .iterate = true }) catch |err| switch (err) {
+        error.NotDir => {
+            try files.append(arena, try importPath(arena, relative));
+            return files.items;
+        },
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        const joined = if (std.mem.eql(u8, relative, ".")) entry.path else try std.fs.path.join(arena, &.{ relative, entry.path });
+        try files.append(arena, try importPath(arena, joined));
+    }
+    return files.items;
+}
+
+fn importPath(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const copy = try arena.dupe(u8, path);
+    std.mem.replaceScalar(u8, copy, '\\', '/');
+    return copy;
+}
+
+/// Parse the copy of `file_path` in `out` and append a declaration listing
+/// its structs and unions. Returns false if it has none.
+fn appendLayoutDecl(arena: std.mem.Allocator, io: std.Io, out: std.Io.Dir, file_path: []const u8) !bool {
+    const source = try out.readFileAllocOptions(io, file_path, arena, .unlimited, .of(u8), 0);
+    const names = try layoutTypeNames(arena, source);
+    if (names.len == 0) {
+        return false;
+    }
+
+    var appended: std.ArrayList(u8) = .empty;
+    try appended.appendSlice(arena, source);
+    try appended.print(arena, "\n\n// Added by snitch's layout step.\npub const {s} = .{{ ", .{layout_decl_name});
+    for (names, 0..) |name, index| {
+        try appended.print(arena, "{s}{s}", .{ if (index == 0) "" else ", ", name });
+    }
+    try appended.appendSlice(arena, " };\n");
+    try out.writeFile(io, .{ .sub_path = file_path, .data = appended.items });
+    return true;
+}
+
+/// Names, usable from the end of the file, of every struct and union with
+/// fields declared at container level in `source`: `Order`, `Outer.Inner`,
+/// and `@This()` when the file itself has fields.
+fn layoutTypeNames(arena: std.mem.Allocator, source: [:0]const u8) ![]const []const u8 {
+    var tree = try std.zig.Ast.parse(arena, source, .{});
+    defer tree.deinit(arena);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    const root = tree.containerDeclRoot();
+    if (hasFields(&tree, root.ast.members)) {
+        try names.append(arena, "@This()");
+    }
+    try collectTypeNames(arena, &tree, root.ast.members, "", &names);
+    return names.items;
+}
+
+fn collectTypeNames(
+    arena: std.mem.Allocator,
+    tree: *const std.zig.Ast,
+    members: []const std.zig.Ast.Node.Index,
+    prefix: []const u8,
+    names: *std.ArrayList([]const u8),
+) !void {
+    for (members) |member| {
+        const var_decl = tree.fullVarDecl(member) orelse continue;
+        const init_node = var_decl.ast.init_node.unwrap() orelse continue;
+        var buffer: [2]std.zig.Ast.Node.Index = undefined;
+        const container = tree.fullContainerDecl(&buffer, init_node) orelse continue;
+
+        const name = tree.tokenSlice(var_decl.ast.mut_token + 1);
+        const path = if (prefix.len == 0) name else try std.fmt.allocPrint(arena, "{s}.{s}", .{ prefix, name });
+        const keyword = tree.tokenSlice(container.ast.main_token);
+        const has_layout = std.mem.eql(u8, keyword, "struct") or std.mem.eql(u8, keyword, "union");
+        if (has_layout and hasFields(tree, container.ast.members)) {
+            try names.append(arena, path);
+        }
+        try collectTypeNames(arena, tree, container.ast.members, path, names);
+    }
+}
+
+fn hasFields(tree: *const std.zig.Ast, members: []const std.zig.Ast.Node.Index) bool {
+    for (members) |member| {
+        switch (tree.nodeTag(member)) {
+            .container_field_init, .container_field_align, .container_field => return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,4 +1563,87 @@ test "safe builds count open zones" {
     const ignored = Zone.inactive;
     ignored.end();
     try std.testing.expectEqual(@as(u32, 0), profiler.open_zones.load(.monotonic));
+}
+
+const layout_fixtures = struct {
+    pub const Loose = extern struct { flag: bool, id: u64, tag: u8 };
+    pub const Tight = extern struct { id: u64, flag: bool, tag: u8 };
+    pub const Auto = struct { flag: bool, id: u64, tag: u8 };
+    pub const Bits = packed struct { a: bool, b: u7 };
+    pub const Either = union(enum) { int: u64, none };
+    pub const Group = struct {
+        pub const Inner = extern struct { a: u8, b: u32 };
+    };
+    pub const Kind = enum { a, b };
+};
+
+test "extern struct layout reports padding and the best possible size" {
+    const loose = comptime describeLayout(layout_fixtures.Loose);
+    try std.testing.expectEqualStrings("extern struct", loose.kind);
+    try std.testing.expectEqual(@as(usize, 24), loose.size);
+    try std.testing.expectEqual(@as(?usize, 14), loose.padding);
+    try std.testing.expectEqual(@as(?usize, 16), loose.best_size);
+    try std.testing.expectEqual(@as(usize, 3), loose.fields.len);
+    try std.testing.expectEqualStrings("flag", loose.fields[0].name);
+    try std.testing.expectEqual(@as(usize, 7), loose.fields[0].padding_after);
+    try std.testing.expectEqual(@as(usize, 8), loose.fields[1].offset);
+    try std.testing.expectEqual(@as(usize, 7), loose.fields[2].padding_after);
+
+    const tight = comptime describeLayout(layout_fixtures.Tight);
+    try std.testing.expectEqual(@as(usize, 16), tight.size);
+    try std.testing.expectEqual(@as(?usize, 6), tight.padding);
+    try std.testing.expectEqual(@as(?usize, 16), tight.best_size);
+}
+
+test "auto, packed and union layouts" {
+    const auto = comptime describeLayout(layout_fixtures.Auto);
+    try std.testing.expectEqualStrings("struct", auto.kind);
+    try std.testing.expectEqual(@sizeOf(layout_fixtures.Auto), auto.size);
+    try std.testing.expectEqual(@as(?usize, null), auto.best_size);
+    for (auto.fields[1..], auto.fields[0 .. auto.fields.len - 1]) |field, previous| {
+        try std.testing.expect(field.offset > previous.offset);
+    }
+
+    const bits = comptime describeLayout(layout_fixtures.Bits);
+    try std.testing.expectEqualStrings("packed struct", bits.kind);
+    try std.testing.expectEqual(@as(?usize, null), bits.padding);
+
+    const either = comptime describeLayout(layout_fixtures.Either);
+    try std.testing.expectEqualStrings("tagged union", either.kind);
+    try std.testing.expectEqual(@as(usize, 0), either.fields.len);
+}
+
+test "layout generator finds structs and unions, including private and nested ones" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+
+    const names = try layoutTypeNames(arena_state.allocator(),
+        \\const std = @import("std");
+        \\first: u32,
+        \\pub const Public = extern struct { a: u8, b: u64 };
+        \\const Private = struct {
+        \\    x: u32,
+        \\    const Inner = union(enum) { a: u8, b: u16 };
+        \\    pub const Namespace = struct {
+        \\        pub const Deep = packed struct { bits: u3 };
+        \\    };
+        \\};
+        \\const Kind = enum { a, b };
+        \\const Empty = struct {};
+        \\fn Generic(comptime T: type) type { return struct { value: T }; }
+        \\fn helper() void { const Local = struct { y: u8 }; _ = Local; }
+    );
+    const expected = [_][]const u8{ "@This()", "Public", "Private", "Private.Inner", "Private.Namespace.Deep" };
+    try std.testing.expectEqual(expected.len, names.len);
+    for (expected, names) |expected_name, name| {
+        try std.testing.expectEqualStrings(expected_name, name);
+    }
+}
+
+test "layout generator keeps target paths inside the module root" {
+    const sep = std.fs.path.sep_str;
+    try std.testing.expectEqualStrings(".", relativeTo(sep ++ "p" ++ sep ++ "src", sep ++ "p" ++ sep ++ "src").?);
+    try std.testing.expectEqualStrings("net" ++ sep ++ "a.zig", relativeTo(sep ++ "p" ++ sep ++ "src", sep ++ "p" ++ sep ++ "src" ++ sep ++ "net" ++ sep ++ "a.zig").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), relativeTo(sep ++ "p" ++ sep ++ "src", sep ++ "p" ++ sep ++ "srcx" ++ sep ++ "a.zig"));
+    try std.testing.expectEqual(@as(?[]const u8, null), relativeTo(sep ++ "p" ++ sep ++ "src", sep ++ "p" ++ sep ++ "lib.zig"));
 }

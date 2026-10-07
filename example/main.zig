@@ -1,6 +1,16 @@
 const std = @import("std");
 const snitch = @import("snitch");
 
+/// A message header as it might be sent over the wire. The field order wastes
+/// space; `zig build snitch-layout -Dsnitch-layout=example` shows how much.
+const Header = extern struct {
+    is_retry: bool,
+    sequence: u64,
+    kind: u8,
+    timestamp_ns: u64,
+    length: u32,
+};
+
 fn busyLoop(iterations: usize) u64 {
     var checksum: u64 = 0;
     var index: usize = 0;

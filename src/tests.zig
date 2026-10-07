@@ -280,3 +280,17 @@ test "process-wide zones are ignored after stop" {
     const zone = snitch.zone("after-stop");
     zone.end();
 }
+
+const LayoutProbe = extern struct { flag: bool, id: u64 };
+
+test "writeLayouts prints a summary and padded field breakdowns" {
+    var storage: [8_192]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try snitch.writeLayouts(&writer, .{LayoutProbe});
+    const output = writer.buffered();
+
+    try expectContains(output, "[snitch] layout of 1 type\n");
+    try std.testing.expectEqual(@as(usize, 2), countOccurrences(output, "tests.LayoutProbe"));
+    try expectContains(output, "| flag  | bool ");
+    try expectContains(output, "7 B |");
+}
