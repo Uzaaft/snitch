@@ -32,15 +32,14 @@ pub fn main(init: std.process.Init) !void {
 
     _ = snitch.measureCall("handler", handler, .{@as(usize, 5)});
 
-    // The `*Here` variants use the caller's file and line as the label.
-    _ = snitch.measureCallHere(handler, .{@as(usize, 7)}, @src());
-    _ = snitch.measureBlockHere(struct {
-        fn run() void {}
-    }.run, @src());
+    // Pass @src() instead of a string to label a zone with the calling
+    // function, file and line: "main (main.zig:26)".
+    var here = snitch.zone(@src());
+    defer here.end();
 }
 ```
 
-Zig cannot capture a caller's location implicitly, so the `*Here` variants take `@src()` as an argument.
+`measureCall` takes the same names as `zone`. Zig cannot capture a caller's location implicitly, so `@src()` has to be passed explicitly.
 
 Zones started before `start` or after `finish` are ignored, so libraries can add zones without requiring the application to use snitch.
 

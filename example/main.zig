@@ -53,11 +53,11 @@ pub fn main(init: std.process.Init) !void {
     const checksum = snitch.measureCall("single-call", busyLoop, .{80_000});
     _ = try snitch.measureCall("alloc-single-call", allocationWork, .{ tracked_allocator, @as(usize, 24_000) });
 
-    _ = snitch.measureBlock("custom-block", struct {
-        fn run() u64 {
-            return busyLoop(40_000);
-        }
-    }.run);
+    {
+        var zone = snitch.zone(@src());
+        defer zone.end();
+        _ = busyLoop(40_000);
+    }
 
     std.debug.print("snitch enabled: {any}, checksum: {d}\n", .{ snitch.enabled, checksum });
 }

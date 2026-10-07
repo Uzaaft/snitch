@@ -11,9 +11,9 @@
 //!
 //! # Notes
 //!
-//! - Zone labels are comptime strings.
-//! - The `*Here` variants label zones with the caller's file and line. Pass
-//!   `@src()` explicitly; Zig cannot capture the caller's location for you.
+//! - Name a zone with a comptime string, or with `@src()` to label it with the
+//!   calling function, file and line. Zig cannot capture the caller's location
+//!   implicitly, so `@src()` has to be passed.
 //! - Memory metrics count allocations made through `snitch.allocator()` (or
 //!   `Profiler.allocator()`) on the thread that ran the zone. End a zone on
 //!   the thread that started it.
@@ -40,11 +40,10 @@
 //!         defer tracked_allocator.free(payload);
 //!     }
 //!
+//!     var here = snitch.zone(@src()); // labeled like "main (main.zig:42)"
+//!     defer here.end();
+//!
 //!     _ = snitch.measureCall("handler", handler, .{ arg1, arg2 });
-//!     _ = snitch.measureCallHere(handler, .{ arg1, arg2 }, @src());
-//!     _ = snitch.measureBlockHere(struct {
-//!         fn run() void {}
-//!     }.run, @src());
 //! }
 //! ```
 const std = @import("std");
@@ -354,69 +353,33 @@ pub const Profiler = struct {
         return self.base_allocator;
     }
 
-    /// Start a zone. Call `end` on the result to record it.
-    pub fn zone(self: *Profiler, comptime label: []const u8) callconv(callingConvention()) Zone {
+    /// Start a zone named by `name`: a string, or `@src()` to use the caller's
+    /// function, file and line. Call `end` on the result to record it.
+    pub fn zone(self: *Profiler, comptime name: anytype) callconv(callingConvention()) Zone {
         if (comptime !enabled) {
             return .{};
         }
 
         return .{
             .profiler = self,
-            .label_index = labelIndex(label),
+            .label_index = labelIndex(zoneLabel(name)),
             .start_alloc_bytes = thread_alloc_bytes,
             .start_alloc_calls = thread_alloc_calls,
             .start = if (timing_enabled) .now(self.io, .awake) else {},
         };
     }
 
-    /// Like `zone`, labeled with the caller's file and line.
-    pub fn zoneHere(
-        self: *Profiler,
-        comptime source_location: std.builtin.SourceLocation,
-    ) callconv(callingConvention()) Zone {
-        return self.zone(comptimeSourceLabel(source_location));
-    }
-
-    /// Call `function` with `args`, measure it, and return its result.
+    /// Call `function` with `args` inside a zone named by `name`, and return
+    /// its result.
     pub fn measureCall(
         self: *Profiler,
-        comptime label: []const u8,
+        comptime name: anytype,
         function: anytype,
         args: anytype,
     ) callconv(callingConvention()) @TypeOf(@call(.auto, function, args)) {
-        var measurement = self.zone(label);
+        var measurement = self.zone(name);
         defer measurement.end();
         return @call(.auto, function, args);
-    }
-
-    /// Like `measureCall`, labeled with the caller's file and line.
-    pub fn measureCallHere(
-        self: *Profiler,
-        function: anytype,
-        args: anytype,
-        comptime source_location: std.builtin.SourceLocation,
-    ) callconv(callingConvention()) @TypeOf(@call(.auto, function, args)) {
-        return self.measureCall(comptimeSourceLabel(source_location), function, args);
-    }
-
-    /// Run `block`, measure it, and return its result.
-    pub fn measureBlock(
-        self: *Profiler,
-        comptime label: []const u8,
-        block: anytype,
-    ) callconv(callingConvention()) @TypeOf(block()) {
-        var measurement = self.zone(label);
-        defer measurement.end();
-        return block();
-    }
-
-    /// Like `measureBlock`, labeled with the caller's file and line.
-    pub fn measureBlockHere(
-        self: *Profiler,
-        block: anytype,
-        comptime source_location: std.builtin.SourceLocation,
-    ) callconv(callingConvention()) @TypeOf(block()) {
-        return self.measureBlock(comptimeSourceLabel(source_location), block);
     }
 
     /// Write the report to stderr.
@@ -798,8 +761,22 @@ fn formatPercent(part: u64, whole: u128, buffer: []u8) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{d:.2}%", .{ratio * 100.0});
 }
 
-fn comptimeSourceLabel(comptime source_location: std.builtin.SourceLocation) []const u8 {
-    return std.fmt.comptimePrint("{s}:{d}", .{ source_location.file, source_location.line });
+/// Zone label for `name`: the string itself, or "function (file:line)" for
+/// a source location from `@src()`.
+fn zoneLabel(comptime name: anytype) []const u8 {
+    const Name = @TypeOf(name);
+    if (Name == std.builtin.SourceLocation) {
+        return std.fmt.comptimePrint("{s} ({s}:{d})", .{ name.fn_name, name.file, name.line });
+    }
+
+    const label: []const u8 = switch (@typeInfo(Name)) {
+        .pointer => name,
+        else => @compileError("zone name must be a string or @src(), found " ++ @typeName(Name)),
+    };
+    if (label.len == 0) {
+        @compileError("zone name must not be empty");
+    }
+    return label;
 }
 
 // ---------------------------------------------------------------------------
@@ -849,58 +826,27 @@ pub fn allocator() callconv(callingConvention()) std.mem.Allocator {
     return profiler.allocator();
 }
 
-/// Start a zone on the process-wide profiler. Call `end` on the result.
-pub fn zone(comptime label: []const u8) callconv(callingConvention()) Zone {
+/// Start a zone on the process-wide profiler, named by a string or `@src()`.
+/// Call `end` on the result.
+pub fn zone(comptime name: anytype) callconv(callingConvention()) Zone {
     if (comptime !enabled) {
         return .{};
     }
 
     const profiler = defaultProfiler() orelse return .inactive;
-    return profiler.zone(label);
+    return profiler.zone(name);
 }
 
-/// Like `zone`, labeled with the caller's file and line.
-pub fn zoneHere(comptime source_location: std.builtin.SourceLocation) callconv(callingConvention()) Zone {
-    return zone(comptimeSourceLabel(source_location));
-}
-
-/// Call `function` with `args`, measure it on the process-wide profiler, and
-/// return its result.
+/// Call `function` with `args` inside a process-wide zone named by `name`,
+/// and return its result.
 pub fn measureCall(
-    comptime label: []const u8,
+    comptime name: anytype,
     function: anytype,
     args: anytype,
 ) callconv(callingConvention()) @TypeOf(@call(.auto, function, args)) {
-    var measurement = zone(label);
+    var measurement = zone(name);
     defer measurement.end();
     return @call(.auto, function, args);
-}
-
-/// Like `measureCall`, labeled with the caller's file and line.
-pub fn measureCallHere(
-    function: anytype,
-    args: anytype,
-    comptime source_location: std.builtin.SourceLocation,
-) callconv(callingConvention()) @TypeOf(@call(.auto, function, args)) {
-    return measureCall(comptimeSourceLabel(source_location), function, args);
-}
-
-/// Run `block`, measure it on the process-wide profiler, and return its result.
-pub fn measureBlock(
-    comptime label: []const u8,
-    block: anytype,
-) callconv(callingConvention()) @TypeOf(block()) {
-    var measurement = zone(label);
-    defer measurement.end();
-    return block();
-}
-
-/// Like `measureBlock`, labeled with the caller's file and line.
-pub fn measureBlockHere(
-    block: anytype,
-    comptime source_location: std.builtin.SourceLocation,
-) callconv(callingConvention()) @TypeOf(block()) {
-    return measureBlock(comptimeSourceLabel(source_location), block);
 }
 
 test "histogram buckets cover u64 and bound the error at 1/64" {

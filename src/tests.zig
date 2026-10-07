@@ -54,31 +54,27 @@ test "measureCall returns wrapped value" {
     try std.testing.expectEqual(@as(u8, 7), value);
 }
 
-test "callsite helper APIs return wrapped values" {
+test "zones and calls accept a source location" {
     var profiler = snitch.Profiler.init(std.testing.io, std.testing.allocator);
     defer profiler.deinit();
 
-    const call_value = profiler.measureCallHere(returnsSeven, .{}, @src());
+    const call_value = profiler.measureCall(@src(), returnsSeven, .{});
     try std.testing.expectEqual(@as(u8, 7), call_value);
 
-    const block_value = profiler.measureBlockHere(struct {
-        fn run() u8 {
-            return 9;
-        }
-    }.run, @src());
-    try std.testing.expectEqual(@as(u8, 9), block_value);
-
-    var zone = profiler.zoneHere(@src());
+    var zone = profiler.zone(@src());
     zone.end();
 }
 
-// Labels are checked against the timing table, which lists every zone; the
-// memory table only lists zones that allocated.
-test "callsite helper labels include file and line" {
-    if (!snitch.enabled) {
-        return;
-    }
+fn measuredHelper(profiler: *snitch.Profiler) std.builtin.SourceLocation {
+    const here = @src();
+    var zone = profiler.zone(here);
+    zone.end();
+    return here;
+}
 
+test "source location labels name the function, file and line" {
+    // The timing table lists every zone; the memory table only lists zones
+    // that allocated.
     if (!snitch.timing_enabled) {
         return;
     }
@@ -86,30 +82,14 @@ test "callsite helper labels include file and line" {
     var profiler = snitch.Profiler.init(std.testing.io, std.testing.allocator);
     defer profiler.deinit();
 
-    const call_location = @src();
-    _ = profiler.measureCallHere(returnsSeven, .{}, call_location);
-
-    const block_location = @src();
-    _ = profiler.measureBlockHere(struct {
-        fn run() u8 {
-            return 11;
-        }
-    }.run, block_location);
-
-    const zone_location = @src();
-    var zone = profiler.zoneHere(zone_location);
-    zone.end();
+    const location = measuredHelper(&profiler);
 
     var report_storage: [4_096]u8 = undefined;
     const report = try writeReportToBuffer(&profiler, &report_storage, .{});
 
-    const call_label = std.fmt.comptimePrint("{s}:{d}", .{ call_location.file, call_location.line });
-    const block_label = std.fmt.comptimePrint("{s}:{d}", .{ block_location.file, block_location.line });
-    const zone_label = std.fmt.comptimePrint("{s}:{d}", .{ zone_location.file, zone_location.line });
-
-    try expectContains(report, call_label);
-    try expectContains(report, block_label);
-    try expectContains(report, zone_label);
+    var label_storage: [128]u8 = undefined;
+    const label = try std.fmt.bufPrint(&label_storage, "measuredHelper ({s}:{d})", .{ location.file, location.line });
+    try expectContains(report, label);
 }
 
 test "zone start and end compiles and runs" {
@@ -274,7 +254,7 @@ test "process-wide profiler records zones between start and stop" {
         }
     }
     try std.testing.expectEqual(@as(u8, 7), snitch.measureCall("global-call", returnsSeven, .{}));
-    try std.testing.expectEqual(@as(u8, 7), snitch.measureCallHere(returnsSeven, .{}, @src()));
+    try std.testing.expectEqual(@as(u8, 7), snitch.measureCall(@src(), returnsSeven, .{}));
 
     if (!snitch.enabled) {
         return;
