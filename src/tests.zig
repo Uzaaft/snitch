@@ -72,12 +72,14 @@ test "callsite helper APIs return wrapped values" {
     zone.end();
 }
 
+// Labels are checked against the timing table, which lists every zone; the
+// memory table only lists zones that allocated.
 test "callsite helper labels include file and line" {
     if (!snitch.enabled or snitch.report_max_rows != 0) {
         return;
     }
 
-    if (!snitch.timing_enabled and !snitch.memory_enabled) {
+    if (!snitch.timing_enabled) {
         return;
     }
 
@@ -176,39 +178,32 @@ test "writeReport output respects compile-time config" {
         return;
     }
 
-    try expectContains(report, "[snitch] zones=1");
+    try expectContains(report, "[snitch] 1 zone\n");
 
     if (!snitch.timing_enabled and !snitch.memory_enabled) {
-        try expectContains(report, "snitch is enabled, but both snitch-timing and snitch-memory are disabled.");
-        try expectNotContains(report, "| Metric");
+        try expectContains(report, "Both snitch-timing and snitch-memory are disabled, so there is nothing to show.");
+        try expectNotContains(report, "| Zone");
         return;
     }
 
-    const timing_percentile_header = std.fmt.comptimePrint("P{d} ns", .{snitch.percentile_target});
-    const memory_bytes_percentile_header = std.fmt.comptimePrint("P{d} bytes", .{snitch.percentile_target});
-    const memory_count_percentile_header = std.fmt.comptimePrint("P{d} allocs", .{snitch.percentile_target});
-
-    try expectContains(report, "| Metric");
+    try expectContains(report, "| Zone");
+    try expectContains(report, " P50 |");
+    try expectContains(report, " P99 |");
     try expectContains(report, "report-zone");
 
     if (snitch.timing_enabled) {
-        try expectContains(report, "snitch-timing - Execution time per call.");
-        try expectContains(report, timing_percentile_header);
+        try expectContains(report, "Timing per call");
     } else {
-        try expectNotContains(report, "snitch-timing - Execution time per call.");
-        try expectNotContains(report, timing_percentile_header);
+        try expectNotContains(report, "Timing per call");
     }
 
     if (snitch.memory_enabled) {
-        try expectContains(report, "snitch-memory-bytes - Bytes allocated per call.");
-        try expectContains(report, "snitch-memory-count - Allocations per call.");
-        try expectContains(report, memory_bytes_percentile_header);
-        try expectContains(report, memory_count_percentile_header);
+        try expectContains(report, "Memory allocated per call");
+        try expectContains(report, " Allocs/call |");
+        try expectContains(report, "96 B");
     } else {
-        try expectNotContains(report, "snitch-memory-bytes - Bytes allocated per call.");
-        try expectNotContains(report, "snitch-memory-count - Allocations per call.");
-        try expectNotContains(report, memory_bytes_percentile_header);
-        try expectNotContains(report, memory_count_percentile_header);
+        try expectNotContains(report, "Memory allocated per call");
+        try expectNotContains(report, "Allocs/call");
     }
 }
 
@@ -255,8 +250,8 @@ test "report max rows truncates sorted sections" {
     var report_storage: [8_192]u8 = undefined;
     const report = try writeReportToBuffer(&profiler, &report_storage);
 
-    const truncation_note = "(showing 1 of 2 rows; build with -Dsnitch-max-rows=0 to show all)";
-    try std.testing.expectEqual(@as(usize, 3), countOccurrences(report, truncation_note));
+    const truncation_note = "(showing 1 of 2 zones; build with -Dsnitch-max-rows=0 to show all)";
+    try std.testing.expectEqual(@as(usize, 2), countOccurrences(report, truncation_note));
     try expectContains(report, "heavy-zone");
     try expectNotContains(report, "light-zone");
 }
@@ -289,9 +284,9 @@ test "process-wide profiler records zones between start and stop" {
     var report_storage: [4_096]u8 = undefined;
     const report = try writeReportToBuffer(profiler, &report_storage);
 
-    try expectContains(report, "[snitch] zones=3");
+    try expectContains(report, "[snitch] 3 zones\n");
     try expectNotContains(report, "before-start");
-    if ((snitch.timing_enabled or snitch.memory_enabled) and snitch.report_max_rows == 0) {
+    if (snitch.timing_enabled and snitch.report_max_rows == 0) {
         try expectContains(report, "global-zone");
         try expectContains(report, "global-call");
     }

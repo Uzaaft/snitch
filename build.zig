@@ -4,7 +4,6 @@ const Config = struct {
     enabled: bool,
     timing_enabled: bool = true,
     memory_enabled: bool = true,
-    percentile: u8 = 85,
     max_rows: usize = 0,
 };
 
@@ -13,7 +12,6 @@ fn addOptionsModule(b: *std.Build, config: Config) *std.Build.Module {
     options.addOption(bool, "snitch", config.enabled);
     options.addOption(bool, "snitch_timing", config.timing_enabled);
     options.addOption(bool, "snitch_memory", config.memory_enabled);
-    options.addOption(u8, "snitch_percentile", config.percentile);
     options.addOption(usize, "snitch_max_rows", config.max_rows);
     return options.createModule();
 }
@@ -42,14 +40,8 @@ pub fn build(b: *std.Build) void {
         .enabled = b.option(bool, "snitch", "Enable instrumentation") orelse false,
         .timing_enabled = b.option(bool, "snitch-timing", "Enable timing metrics") orelse true,
         .memory_enabled = b.option(bool, "snitch-memory", "Enable allocation metrics") orelse true,
-        .percentile = b.option(u8, "snitch-percentile", "Percentile shown in reports (1-100)") orelse 85,
         .max_rows = b.option(usize, "snitch-max-rows", "Max rows per report section (0 = unlimited)") orelse 0,
     };
-
-    if (config.percentile == 0 or config.percentile > 100) {
-        std.log.err("snitch-percentile must be between 1 and 100, got {d}", .{config.percentile});
-        std.process.exit(1);
-    }
 
     const snitch = b.addModule("snitch", .{
         .root_source_file = b.path("src/snitch.zig"),
@@ -82,9 +74,9 @@ pub fn build(b: *std.Build) void {
     // selected at compile time.
     const test_configs = [_]struct { name: []const u8, config: Config }{
         .{ .name = "off", .config = .{ .enabled = false } },
-        .{ .name = "on", .config = .{ .enabled = true, .percentile = 95 } },
-        .{ .name = "timing-only", .config = .{ .enabled = true, .memory_enabled = false, .percentile = 95 } },
-        .{ .name = "memory-only", .config = .{ .enabled = true, .timing_enabled = false, .percentile = 95 } },
+        .{ .name = "on", .config = .{ .enabled = true } },
+        .{ .name = "timing-only", .config = .{ .enabled = true, .memory_enabled = false } },
+        .{ .name = "memory-only", .config = .{ .enabled = true, .timing_enabled = false } },
         .{ .name = "groups-disabled", .config = .{ .enabled = true, .timing_enabled = false, .memory_enabled = false } },
         .{ .name = "limited-rows", .config = .{ .enabled = true, .max_rows = 1 } },
     };

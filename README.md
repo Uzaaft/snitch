@@ -66,10 +66,9 @@ try profiler.printReport(); // or profiler.writeReport(writer)
 | `-Dsnitch` | `false` | Turn instrumentation on. |
 | `-Dsnitch-timing` | `true` | Record execution time. |
 | `-Dsnitch-memory` | `true` | Record allocations. |
-| `-Dsnitch-percentile` | `85` | Percentile column in the report, from 1 to 100. |
 | `-Dsnitch-max-rows` | `0` | Rows per report section. `0` shows all rows. |
 
-The timing and memory flags only matter when `-Dsnitch=true`. A percentile outside 1–100 fails the build.
+The timing and memory flags only matter when `-Dsnitch=true`.
 
 ## Using snitch as a dependency
 
@@ -80,7 +79,6 @@ const snitch_dep = b.dependency("snitch", .{
     .snitch = b.option(bool, "snitch", "Enable profiling") orelse false,
     .@"snitch-timing" = b.option(bool, "snitch-timing", "Enable timing metrics") orelse true,
     .@"snitch-memory" = b.option(bool, "snitch-memory", "Enable memory metrics") orelse true,
-    .@"snitch-percentile" = b.option(u8, "snitch-percentile", "Report percentile") orelse 85,
     .@"snitch-max-rows" = b.option(usize, "snitch-max-rows", "Max rows per report section") orelse 0,
 });
 
@@ -89,13 +87,26 @@ exe.root_module.addImport("snitch", snitch_dep.module("snitch"));
 
 ## The report
 
-The report has up to three sections, depending on which metrics are enabled:
+```
+[snitch] 2 zones
 
-- `snitch-timing`: execution time per call, in nanoseconds.
-- `snitch-memory-bytes`: bytes allocated per call.
-- `snitch-memory-count`: allocations per call.
+Timing per call
++-------------+-------+---------+---------+---------+---------+---------+---------+---------+
+| Zone        | Calls |     Avg |     P50 |     P95 |     P99 |     Max |   Total | % Total |
++-------------+-------+---------+---------+---------+---------+---------+---------+---------+
+| alloc-work  | 2,000 | 3.31 us | 3.07 us | 5.38 us | 9.47 us | 48.9 us | 6.62 ms |  70.88% |
+| busy-loop   | 2,000 | 1.36 us | 1.33 us | 2.34 us | 2.43 us | 4.53 us | 2.72 ms |  29.12% |
++-------------+-------+---------+---------+---------+---------+---------+---------+---------+
 
-Each section lists `Calls`, `Avg`, the configured percentile (`P85` by default), `Total` and `% Total`, sorted by `Total` from highest to lowest. When `-Dsnitch-max-rows` is set, each section shows only its top rows and notes how many it left out.
+Memory allocated per call
++-------------+-------+-------+-------+-------+-------+-------+---------+-------------+---------+
+| Zone        | Calls |   Avg |   P50 |   P95 |   P99 |   Max |   Total | Allocs/call | % Total |
++-------------+-------+-------+-------+-------+-------+-------+---------+-------------+---------+
+| alloc-work  | 2,000 | 190 B | 191 B | 249 B | 255 B | 255 B | 372 KiB |        1.00 | 100.00% |
++-------------+-------+-------+-------+-------+-------+-------+---------+-------------+---------+
+```
+
+The timing table lists every zone. The memory table lists only zones that allocated through the tracked allocator. Both are sorted by `Total`, highest first. When `-Dsnitch-max-rows` is set, each table shows only its top rows and notes how many it left out.
 
 Percentiles come from a fixed-size histogram per label, so memory use stays flat no matter how many times a zone runs. A percentile may read up to 1/64 (about 1.6%) above the true value; averages and totals are exact.
 

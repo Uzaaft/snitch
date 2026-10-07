@@ -8,7 +8,6 @@
 //! - `-Dsnitch`: master switch (default `false`).
 //! - `-Dsnitch-timing`: record execution time (default `true`).
 //! - `-Dsnitch-memory`: record allocations (default `true`).
-//! - `-Dsnitch-percentile`: percentile column in reports, 1-100 (default `85`).
 //! - `-Dsnitch-max-rows`: rows per report section, `0` for all (default `0`).
 //!
 //! # Notes
@@ -17,9 +16,10 @@
 //! - The `*Here` variants label zones with the caller's file and line. Pass
 //!   `@src()` explicitly; Zig cannot capture the caller's location for you.
 //! - Memory metrics count allocations made through `snitch.allocator()` (or
-//!   `Profiler.allocator()`) on the thread that ran the zone. End a zone on the thread that started it.
+//!   `Profiler.allocator()`) on the thread that ran the zone. End a zone on
+//!   the thread that started it.
 //! - Percentiles come from a fixed-size histogram and may read up to 1/64
-//!   (about 1.6%) above the true value. Averages and totals are exact.
+//!   (about 1.6%) above the true value. Averages, totals and maxima are exact.
 //! - A program can use at most 1024 distinct zone labels.
 //!
 //! # Example
@@ -60,17 +60,8 @@ pub const timing_enabled = enabled and build_options.snitch_timing;
 /// True when snitch is enabled and memory metrics are on.
 pub const memory_enabled = enabled and build_options.snitch_memory;
 
-/// Percentile shown in report columns, set via `-Dsnitch-percentile`.
-pub const percentile_target = build_options.snitch_percentile;
-
 /// Maximum rows printed per section, set via `-Dsnitch-max-rows`.
 pub const report_max_rows = build_options.snitch_max_rows;
-
-comptime {
-    if (percentile_target == 0 or percentile_target > 100) {
-        @compileError("snitch_percentile must be between 1 and 100");
-    }
-}
 
 /// Upper bound on distinct zone labels in one program.
 const max_labels = 1024;
@@ -544,26 +535,39 @@ const LabeledSlot = struct {
     slot: *const Slot,
 };
 
-const Section = struct {
-    title: []const u8,
-    unit: []const u8,
-    enabled: bool,
-    /// Which histogram of a slot this section reads.
-    field: []const u8,
-};
-
-const sections = [_]Section{
-    .{ .title = "snitch-timing - Execution time per call.", .unit = "ns", .enabled = timing_enabled, .field = "timing" },
-    .{ .title = "snitch-memory-bytes - Bytes allocated per call.", .unit = "bytes", .enabled = memory_enabled, .field = "alloc_bytes" },
-    .{ .title = "snitch-memory-count - Allocations per call.", .unit = "allocs", .enabled = memory_enabled, .field = "alloc_calls" },
-};
+const Unit = enum { time, bytes };
 
 const Row = struct {
     label: []const u8,
     calls: u64,
     avg: u64,
-    percentile: u64,
+    p50: u64,
+    p95: u64,
+    p99: u64,
+    max: u64,
     total: u64,
+    /// Average allocation calls per zone; only shown in the memory table.
+    allocs_per_call: f64,
+
+    fn fromHistogram(label: []const u8, histogram: *const Histogram) Row {
+        const calls = histogram.count();
+        const total = @atomicLoad(u64, &histogram.total, .monotonic);
+        if (calls == 0) {
+            return .{ .label = label, .calls = 0, .avg = 0, .p50 = 0, .p95 = 0, .p99 = 0, .max = 0, .total = total, .allocs_per_call = 0 };
+        }
+
+        return .{
+            .label = label,
+            .calls = calls,
+            .avg = total / calls,
+            .p50 = histogram.percentile(calls, 50),
+            .p95 = histogram.percentile(calls, 95),
+            .p99 = histogram.percentile(calls, 99),
+            .max = @atomicLoad(u64, &histogram.max, .monotonic),
+            .total = total,
+            .allocs_per_call = 0,
+        };
+    }
 
     fn moreTotalFirst(_: void, lhs: Row, rhs: Row) bool {
         if (lhs.total != rhs.total) {
@@ -573,106 +577,126 @@ const Row = struct {
     }
 };
 
-const column_count = 6;
 const max_label_width = 40;
+const cell_capacity = max_label_width;
+const timing_columns = [_][]const u8{ "Zone", "Calls", "Avg", "P50", "P95", "P99", "Max", "Total", "% Total" };
+const memory_columns = [_][]const u8{ "Zone", "Calls", "Avg", "P50", "P95", "P99", "Max", "Total", "Allocs/call", "% Total" };
 
 fn writeReportEntries(gpa: std.mem.Allocator, writer: *std.Io.Writer, entries: []const LabeledSlot) !void {
-    try writer.print("[snitch] zones={d}\n\n", .{entries.len});
+    try writer.print("[snitch] {d} zone{s}\n", .{ entries.len, if (entries.len == 1) "" else "s" });
 
     if (entries.len == 0) {
-        try writer.writeAll("(no measurements)\n");
         return;
     }
 
     if (!timing_enabled and !memory_enabled) {
-        try writer.writeAll("snitch is enabled, but both snitch-timing and snitch-memory are disabled.\n");
+        try writer.writeAll("Both snitch-timing and snitch-memory are disabled, so there is nothing to show.\n");
         return;
     }
 
     const rows = try gpa.alloc(Row, entries.len);
     defer gpa.free(rows);
 
-    var first = true;
-    inline for (sections) |section| {
-        if (section.enabled) {
-            if (!first) {
-                try writer.writeByte('\n');
-            }
-            first = false;
+    if (timing_enabled) {
+        for (entries, rows) |entry, *row| {
+            row.* = .fromHistogram(entry.label, &entry.slot.timing);
+        }
+        try writer.writeAll("\nTiming per call\n");
+        try writeTable(writer, .time, &timing_columns, rows);
+    }
 
-            var section_total: u128 = 0;
-            for (entries, rows) |entry, *row| {
-                const histogram = &@field(entry.slot, section.field);
-                const calls = histogram.count();
-                const total = @atomicLoad(u64, &histogram.total, .monotonic);
-                row.* = .{
-                    .label = entry.label,
-                    .calls = calls,
-                    .avg = if (calls == 0) 0 else total / calls,
-                    .percentile = if (calls == 0) 0 else histogram.percentile(calls, percentile_target),
-                    .total = total,
-                };
-                section_total += total;
-            }
+    if (memory_enabled) {
+        // Zones that allocated nothing would only add rows of zeros.
+        var allocating: usize = 0;
+        for (entries) |entry| {
+            const row: Row = .fromHistogram(entry.label, &entry.slot.alloc_bytes);
+            if (row.total == 0) continue;
+            const allocs = @atomicLoad(u64, &entry.slot.alloc_calls.total, .monotonic);
+            rows[allocating] = row;
+            rows[allocating].allocs_per_call = @as(f64, @floatFromInt(allocs)) / @as(f64, @floatFromInt(row.calls));
+            allocating += 1;
+        }
 
-            std.sort.pdq(Row, rows, {}, Row.moreTotalFirst);
-            try writeTable(writer, section, rows, section_total);
+        try writer.writeAll("\nMemory allocated per call\n");
+        if (allocating == 0) {
+            try writer.writeAll("(no zone allocated through the tracked allocator)\n");
+        } else {
+            try writeTable(writer, .bytes, &memory_columns, rows[0..allocating]);
         }
     }
 }
 
-fn writeTable(writer: *std.Io.Writer, comptime section: Section, rows: []const Row, section_total: u128) !void {
-    const header = [column_count][]const u8{
-        "Metric",
-        "Calls",
-        "Avg " ++ section.unit,
-        std.fmt.comptimePrint("P{d} {s}", .{ percentile_target, section.unit }),
-        "Total " ++ section.unit,
-        "% Total",
-    };
+fn writeTable(writer: *std.Io.Writer, comptime unit: Unit, comptime header: []const []const u8, rows: []Row) !void {
+    const column_count = header.len;
+    const Cells = [column_count][]const u8;
+    const Buffers = [column_count][cell_capacity]u8;
+
+    std.sort.pdq(Row, rows, {}, Row.moreTotalFirst);
     const visible = if (report_max_rows == 0) rows else rows[0..@min(rows.len, report_max_rows)];
+
+    var grand_total: u128 = 0;
+    for (rows) |row| {
+        grand_total += row.total;
+    }
 
     var widths: [column_count]usize = undefined;
     for (&widths, header) |*width, cell| {
         width.* = cell.len;
     }
-    widths[5] = "100.00%".len;
     for (visible) |row| {
-        widths[0] = @max(widths[0], @min(max_label_width, row.label.len));
-        widths[1] = @max(widths[1], std.fmt.count("{d}", .{row.calls}));
-        widths[2] = @max(widths[2], std.fmt.count("{d}", .{row.avg}));
-        widths[3] = @max(widths[3], std.fmt.count("{d}", .{row.percentile}));
-        widths[4] = @max(widths[4], std.fmt.count("{d}", .{row.total}));
+        var buffers: Buffers = undefined;
+        for (&widths, try rowCells(unit, column_count, row, grand_total, &buffers)) |*width, cell| {
+            width.* = @max(width.*, cell.len);
+        }
     }
 
-    try writer.print("{s}\n", .{section.title});
-    try writeSeparator(writer, widths);
-    try writeRow(writer, widths, header);
-    try writeSeparator(writer, widths);
-
+    try writeSeparator(writer, &widths);
+    try writeRow(writer, &widths, header);
+    try writeSeparator(writer, &widths);
     for (visible) |row| {
-        var label_buffer: [max_label_width]u8 = undefined;
-        var buffers: [column_count][32]u8 = undefined;
-        try writeRow(writer, widths, .{
-            truncateLabel(row.label, &label_buffer),
-            try std.fmt.bufPrint(&buffers[1], "{d}", .{row.calls}),
-            try std.fmt.bufPrint(&buffers[2], "{d}", .{row.avg}),
-            try std.fmt.bufPrint(&buffers[3], "{d}", .{row.percentile}),
-            try std.fmt.bufPrint(&buffers[4], "{d}", .{row.total}),
-            try formatPercent(row.total, section_total, &buffers[5]),
-        });
+        var buffers: Buffers = undefined;
+        const cells: Cells = try rowCells(unit, column_count, row, grand_total, &buffers);
+        try writeRow(writer, &widths, &cells);
     }
-    try writeSeparator(writer, widths);
+    try writeSeparator(writer, &widths);
 
     if (visible.len < rows.len) {
         try writer.print(
-            "(showing {d} of {d} rows; build with -Dsnitch-max-rows=0 to show all)\n",
+            "(showing {d} of {d} zones; build with -Dsnitch-max-rows=0 to show all)\n",
             .{ visible.len, rows.len },
         );
     }
 }
 
-fn writeSeparator(writer: *std.Io.Writer, widths: [column_count]usize) !void {
+fn rowCells(
+    comptime unit: Unit,
+    comptime column_count: usize,
+    row: Row,
+    grand_total: u128,
+    buffers: *[column_count][cell_capacity]u8,
+) ![column_count][]const u8 {
+    const format = switch (unit) {
+        .time => formatDuration,
+        .bytes => formatBytes,
+    };
+
+    var cells: [column_count][]const u8 = undefined;
+    cells[0] = truncateLabel(row.label, buffers[0][0..max_label_width]);
+    cells[1] = try formatCount(row.calls, &buffers[1]);
+    cells[2] = try format(row.avg, &buffers[2]);
+    cells[3] = try format(row.p50, &buffers[3]);
+    cells[4] = try format(row.p95, &buffers[4]);
+    cells[5] = try format(row.p99, &buffers[5]);
+    cells[6] = try format(row.max, &buffers[6]);
+    cells[7] = try format(row.total, &buffers[7]);
+    if (unit == .bytes) {
+        cells[8] = try std.fmt.bufPrint(&buffers[8], "{d:.2}", .{row.allocs_per_call});
+    }
+    cells[column_count - 1] = try formatPercent(row.total, grand_total, &buffers[column_count - 1]);
+    return cells;
+}
+
+fn writeSeparator(writer: *std.Io.Writer, widths: []const usize) !void {
     for (widths) |width| {
         try writer.writeByte('+');
         try writer.splatByteAll('-', width + 2);
@@ -680,8 +704,8 @@ fn writeSeparator(writer: *std.Io.Writer, widths: [column_count]usize) !void {
     try writer.writeAll("+\n");
 }
 
-/// The label column is left-aligned; the numeric columns are right-aligned.
-fn writeRow(writer: *std.Io.Writer, widths: [column_count]usize, cells: [column_count][]const u8) !void {
+/// The zone column is left-aligned; the numeric columns are right-aligned.
+fn writeRow(writer: *std.Io.Writer, widths: []const usize, cells: []const []const u8) !void {
     for (cells, widths, 0..) |cell, width, column| {
         if (column == 0) {
             try writer.print("| {s:<[1]} ", .{ cell, width });
@@ -701,6 +725,55 @@ fn truncateLabel(label: []const u8, buffer: *[max_label_width]u8) []const u8 {
     @memcpy(buffer[0..kept], label[0..kept]);
     @memcpy(buffer[kept..], "...");
     return buffer;
+}
+
+/// Scale `value` to the largest unit it reaches and print three significant
+/// digits, e.g. "1.23 ms" or "456 KiB".
+fn formatScaled(value: u64, comptime units: []const []const u8, comptime step: f64, buffer: []u8) ![]const u8 {
+    if (value < step) {
+        return std.fmt.bufPrint(buffer, "{d} {s}", .{ value, units[0] });
+    }
+
+    var scaled: f64 = @floatFromInt(value);
+    var unit_index: usize = 0;
+    // Stepping up at 999.5 keeps rounding from printing "1000 us".
+    while (scaled >= step - 0.5 and unit_index + 1 < units.len) {
+        scaled /= step;
+        unit_index += 1;
+    }
+
+    if (scaled < 9.995) {
+        return std.fmt.bufPrint(buffer, "{d:.2} {s}", .{ scaled, units[unit_index] });
+    }
+    if (scaled < 99.95) {
+        return std.fmt.bufPrint(buffer, "{d:.1} {s}", .{ scaled, units[unit_index] });
+    }
+    return std.fmt.bufPrint(buffer, "{d:.0} {s}", .{ scaled, units[unit_index] });
+}
+
+fn formatDuration(ns: u64, buffer: []u8) std.fmt.BufPrintError![]const u8 {
+    return formatScaled(ns, &.{ "ns", "us", "ms", "s" }, 1000, buffer);
+}
+
+fn formatBytes(bytes: u64, buffer: []u8) std.fmt.BufPrintError![]const u8 {
+    return formatScaled(bytes, &.{ "B", "KiB", "MiB", "GiB", "TiB" }, 1024, buffer);
+}
+
+/// Integer with thousands separators, e.g. "1,234,567".
+fn formatCount(value: u64, buffer: []u8) std.fmt.BufPrintError![]const u8 {
+    var digits_buffer: [20]u8 = undefined;
+    const digits = try std.fmt.bufPrint(&digits_buffer, "{d}", .{value});
+
+    var len: usize = 0;
+    for (digits, 0..) |digit, index| {
+        if (index > 0 and (digits.len - index) % 3 == 0) {
+            buffer[len] = ',';
+            len += 1;
+        }
+        buffer[len] = digit;
+        len += 1;
+    }
+    return buffer[0..len];
 }
 
 fn formatPercent(part: u64, whole: u128, buffer: []u8) ![]const u8 {
@@ -818,7 +891,6 @@ pub fn measureBlockHere(
 }
 
 test "histogram buckets cover u64 and bound the error at 1/64" {
-
     var value: u64 = 0;
     while (value < 4_096) : (value += 1) {
         const upper = Histogram.bucketUpperBound(Histogram.bucketIndex(value));
@@ -931,4 +1003,24 @@ test "concurrent zones are all recorded" {
 
     const slot = labelSlot(&profiler, "concurrent");
     try std.testing.expectEqual(@as(u64, thread_count * zones_per_thread), slot.calls());
+}
+
+test "report numbers are human readable" {
+    const cases = [_]struct { format: *const fn (u64, []u8) std.fmt.BufPrintError![]const u8, value: u64, expected: []const u8 }{
+        .{ .format = formatDuration, .value = 999, .expected = "999 ns" },
+        .{ .format = formatDuration, .value = 1_234, .expected = "1.23 us" },
+        .{ .format = formatDuration, .value = 999_700, .expected = "1.00 ms" },
+        .{ .format = formatDuration, .value = 45_600_000, .expected = "45.6 ms" },
+        .{ .format = formatDuration, .value = 3_000_000_000_000, .expected = "3000 s" },
+        .{ .format = formatBytes, .value = 512, .expected = "512 B" },
+        .{ .format = formatBytes, .value = 1_536, .expected = "1.50 KiB" },
+        .{ .format = formatBytes, .value = 381_080, .expected = "372 KiB" },
+        .{ .format = formatCount, .value = 7, .expected = "7" },
+        .{ .format = formatCount, .value = 1_000, .expected = "1,000" },
+        .{ .format = formatCount, .value = 12_345_678, .expected = "12,345,678" },
+    };
+    for (cases) |case| {
+        var buffer: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(case.expected, try case.format(case.value, &buffer));
+    }
 }
