@@ -43,6 +43,8 @@ pub fn main(init: std.process.Init) !void {
 
 Zones started before `start` or after `finish` are ignored, so libraries can add zones without requiring the application to use snitch.
 
+End every zone before calling `finish`, including zones on other threads. Debug and ReleaseSafe builds panic if one is still open; other builds don't check.
+
 ### Separate profilers
 
 To keep separate sets of metrics, create a `Profiler` yourself. It has the same functions as methods:

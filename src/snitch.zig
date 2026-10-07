@@ -64,6 +64,10 @@ pub const ReportOptions = struct {
     max_rows: usize = 0,
 };
 
+/// Safe builds count open zones so freeing a profiler too early panics with a
+/// clear message instead of corrupting memory.
+const track_open_zones = enabled and std.debug.runtime_safety;
+
 /// Upper bound on distinct zone labels in one program.
 const max_labels = 1024;
 
@@ -317,6 +321,9 @@ pub const Profiler = struct {
     base_allocator: std.mem.Allocator,
     tracking_allocator_state: TrackingAllocator,
     slots: if (enabled) [max_labels]?*Slot else void,
+    /// Zones started but not yet ended. Only tracked in safe builds, to catch
+    /// freeing the profiler while another thread is still inside a zone.
+    open_zones: if (track_open_zones) std.atomic.Value(u32) else void,
 
     /// Create a profiler. `io` provides the clock; `base_allocator` holds
     /// the profiler's own storage and must be thread-safe if zones end on
@@ -327,11 +334,14 @@ pub const Profiler = struct {
             .base_allocator = base_allocator,
             .tracking_allocator_state = .{ .parent = base_allocator },
             .slots = if (enabled) @splat(null) else {},
+            .open_zones = if (track_open_zones) .init(0) else {},
         };
     }
 
-    /// Free all recorded metrics.
+    /// Free all recorded metrics. Every zone must have ended.
     pub fn deinit(self: *Profiler) callconv(callingConvention()) void {
+        self.assertNoOpenZones();
+
         if (enabled) {
             for (self.slots) |maybe_slot| {
                 if (maybe_slot) |slot| {
@@ -358,6 +368,10 @@ pub const Profiler = struct {
     pub fn zone(self: *Profiler, comptime name: anytype) callconv(callingConvention()) Zone {
         if (comptime !enabled) {
             return .{};
+        }
+
+        if (track_open_zones) {
+            _ = self.open_zones.fetchAdd(1, .monotonic);
         }
 
         return .{
@@ -412,6 +426,20 @@ pub const Profiler = struct {
         }
 
         try writeReportEntries(self.base_allocator, writer, entries[0..entry_count], options);
+    }
+
+    fn assertNoOpenZones(self: *Profiler) void {
+        if (!track_open_zones) {
+            return;
+        }
+
+        const open = self.open_zones.load(.acquire);
+        if (open != 0) {
+            std.debug.panic(
+                "snitch: profiler freed while {d} zone(s) are still open; end every zone before finish, stop or deinit",
+                .{open},
+            );
+        }
     }
 
     /// Slot for a label index, created on first use. Racing threads may
@@ -470,6 +498,9 @@ pub const Zone = if (enabled) struct {
     /// Stop measuring and record the sample.
     pub fn end(self: Zone) void {
         const profiler = self.profiler orelse return;
+        if (track_open_zones) {
+            _ = profiler.open_zones.fetchSub(1, .release);
+        }
 
         const elapsed_ns: u64 = if (timing_enabled) blk: {
             const now = std.Io.Timestamp.now(profiler.io, .awake);
@@ -798,6 +829,7 @@ pub fn finish(options: ReportOptions) callconv(callingConvention()) void {
         return;
     }
 
+    default_profiler.assertNoOpenZones();
     default_profiler.printReport(options) catch {};
     stop();
 }
@@ -979,4 +1011,22 @@ test "report numbers are human readable" {
         var buffer: [32]u8 = undefined;
         try std.testing.expectEqualStrings(case.expected, try case.format(case.value, &buffer));
     }
+}
+
+test "safe builds count open zones" {
+    if (!track_open_zones) return;
+
+    var profiler = Profiler.init(std.testing.io, std.testing.allocator);
+    defer profiler.deinit();
+
+    const outer = profiler.zone("outer");
+    const inner = profiler.zone("inner");
+    try std.testing.expectEqual(@as(u32, 2), profiler.open_zones.load(.monotonic));
+    inner.end();
+    outer.end();
+    try std.testing.expectEqual(@as(u32, 0), profiler.open_zones.load(.monotonic));
+
+    const ignored = Zone.inactive;
+    ignored.end();
+    try std.testing.expectEqual(@as(u32, 0), profiler.open_zones.load(.monotonic));
 }
