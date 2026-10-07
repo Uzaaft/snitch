@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
     defer snitch.finish(.{});
 
     {
-        var zone = snitch.zone("db-query");
+        const zone = snitch.zone("db-query");
         defer zone.end();
 
         // Allocations through this allocator count towards memory metrics.
@@ -34,7 +34,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Pass @src() instead of a string to label a zone with the calling
     // function, file and line: "main (main.zig:26)".
-    var here = snitch.zone(@src());
+    const here = snitch.zone(@src());
     defer here.end();
 }
 ```
@@ -51,7 +51,7 @@ To keep separate sets of metrics, create a `Profiler` yourself. It has the same 
 var profiler = snitch.Profiler.init(io, allocator);
 defer profiler.deinit();
 
-var zone = profiler.zone("db-query");
+const zone = profiler.zone("db-query");
 zone.end();
 _ = profiler.measureCall("handler", handler, .{@as(usize, 5)});
 

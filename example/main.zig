@@ -38,13 +38,13 @@ pub fn main(init: std.process.Init) !void {
     var run_index: usize = 0;
     while (run_index < 2_000) : (run_index += 1) {
         {
-            var zone = snitch.zone("busy-loop");
+            const zone = snitch.zone("busy-loop");
             defer zone.end();
             _ = busyLoop(600 + run_index);
         }
 
         {
-            var zone = snitch.zone("alloc-work");
+            const zone = snitch.zone("alloc-work");
             defer zone.end();
             _ = try allocationWork(tracked_allocator, 128 + (run_index % 128));
         }
@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try snitch.measureCall("alloc-single-call", allocationWork, .{ tracked_allocator, @as(usize, 24_000) });
 
     {
-        var zone = snitch.zone(@src());
+        const zone = snitch.zone(@src());
         defer zone.end();
         _ = busyLoop(40_000);
     }

@@ -32,7 +32,7 @@
 //!     defer snitch.finish(.{}); // prints the report to stderr
 //!
 //!     {
-//!         var zone = snitch.zone("db-query");
+//!         const zone = snitch.zone("db-query");
 //!         defer zone.end();
 //!
 //!         const tracked_allocator = snitch.allocator();
@@ -40,7 +40,7 @@
 //!         defer tracked_allocator.free(payload);
 //!     }
 //!
-//!     var here = snitch.zone(@src()); // labeled like "main (main.zig:42)"
+//!     const here = snitch.zone(@src()); // labeled like "main (main.zig:42)"
 //!     defer here.end();
 //!
 //!     _ = snitch.measureCall("handler", handler, .{ arg1, arg2 });
@@ -377,7 +377,7 @@ pub const Profiler = struct {
         function: anytype,
         args: anytype,
     ) callconv(callingConvention()) @TypeOf(@call(.auto, function, args)) {
-        var measurement = self.zone(name);
+        const measurement = self.zone(name);
         defer measurement.end();
         return @call(.auto, function, args);
     }
@@ -449,8 +449,8 @@ pub const Profiler = struct {
     }
 };
 
-/// A measurement in progress. Call `end` exactly once, on the thread that
-/// started it.
+/// A measurement in progress. Call `end` once, on the thread that started
+/// it; calling it twice records the zone twice.
 pub const Zone = if (enabled) struct {
     /// Null for zones started before `snitch.start`; ending them does nothing.
     profiler: ?*Profiler,
@@ -458,7 +458,6 @@ pub const Zone = if (enabled) struct {
     start_alloc_bytes: u64,
     start_alloc_calls: u64,
     start: if (timing_enabled) std.Io.Timestamp else void,
-    finished: bool = false,
 
     const inactive: Zone = .{
         .profiler = null,
@@ -469,8 +468,7 @@ pub const Zone = if (enabled) struct {
     };
 
     /// Stop measuring and record the sample.
-    pub fn end(self: *Zone) void {
-        std.debug.assert(!self.finished);
+    pub fn end(self: Zone) void {
         const profiler = self.profiler orelse return;
 
         const elapsed_ns: u64 = if (timing_enabled) blk: {
@@ -486,10 +484,9 @@ pub const Zone = if (enabled) struct {
             thread_alloc_bytes -% self.start_alloc_bytes,
             thread_alloc_calls -% self.start_alloc_calls,
         );
-        self.finished = true;
     }
 } else struct {
-    pub inline fn end(_: *Zone) void {}
+    pub inline fn end(_: Zone) void {}
 };
 
 // ---------------------------------------------------------------------------
@@ -844,7 +841,7 @@ pub fn measureCall(
     function: anytype,
     args: anytype,
 ) callconv(callingConvention()) @TypeOf(@call(.auto, function, args)) {
-    var measurement = zone(name);
+    const measurement = zone(name);
     defer measurement.end();
     return @call(.auto, function, args);
 }
@@ -900,11 +897,11 @@ test "a label used at several call sites shares one slot" {
     var profiler = Profiler.init(std.testing.io, std.testing.allocator);
     defer profiler.deinit();
 
-    var first = profiler.zone("shared-label");
+    const first = profiler.zone("shared-label");
     first.end();
-    var second = profiler.zone("shared-" ++ "label");
+    const second = profiler.zone("shared-" ++ "label");
     second.end();
-    var other = profiler.zone("other-label");
+    const other = profiler.zone("other-label");
     other.end();
 
     try std.testing.expectEqual(@as(u64, 2), labelSlot(&profiler, "shared-label").calls());
@@ -918,7 +915,7 @@ test "zones only count allocations made on their own thread" {
     defer profiler.deinit();
     const tracked = profiler.allocator();
 
-    var measurement = profiler.zone("thread-local-allocs");
+    const measurement = profiler.zone("thread-local-allocs");
 
     const thread = try std.Thread.spawn(.{}, struct {
         fn run(parent: std.mem.Allocator) !void {
@@ -950,7 +947,7 @@ test "concurrent zones are all recorded" {
         thread.* = try std.Thread.spawn(.{}, struct {
             fn run(p: *Profiler) void {
                 for (0..zones_per_thread) |_| {
-                    var measurement = p.zone("concurrent");
+                    const measurement = p.zone("concurrent");
                     measurement.end();
                 }
             }

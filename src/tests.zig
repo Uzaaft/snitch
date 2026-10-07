@@ -61,13 +61,13 @@ test "zones and calls accept a source location" {
     const call_value = profiler.measureCall(@src(), returnsSeven, .{});
     try std.testing.expectEqual(@as(u8, 7), call_value);
 
-    var zone = profiler.zone(@src());
+    const zone = profiler.zone(@src());
     zone.end();
 }
 
 fn measuredHelper(profiler: *snitch.Profiler) std.builtin.SourceLocation {
     const here = @src();
-    var zone = profiler.zone(here);
+    const zone = profiler.zone(here);
     zone.end();
     return here;
 }
@@ -96,7 +96,7 @@ test "zone start and end compiles and runs" {
     var profiler = snitch.Profiler.init(std.testing.io, std.testing.allocator);
     defer profiler.deinit();
 
-    var zone = profiler.zone("simple-zone");
+    const zone = profiler.zone("simple-zone");
     zone.end();
 }
 
@@ -125,7 +125,7 @@ test "disabled mode keeps no-op surface" {
     const payload = try allocator.alloc(u8, 8);
     allocator.free(payload);
 
-    var zone = profiler.zone("disabled-zone");
+    const zone = profiler.zone("disabled-zone");
     zone.end();
 
     try profiler.printReport(.{});
@@ -138,7 +138,7 @@ test "writeReport output respects compile-time config" {
     const tracked_allocator = profiler.allocator();
 
     {
-        var zone = profiler.zone("report-zone");
+        const zone = profiler.zone("report-zone");
         defer zone.end();
 
         _ = burnCpu(40_000);
@@ -202,7 +202,7 @@ test "report max rows truncates sorted sections" {
     const tracked_allocator = profiler.allocator();
 
     {
-        var zone = profiler.zone("heavy-zone");
+        const zone = profiler.zone("heavy-zone");
         defer zone.end();
 
         const payload = try tracked_allocator.alloc(u8, 16_384);
@@ -217,7 +217,7 @@ test "report max rows truncates sorted sections" {
     }
 
     {
-        var zone = profiler.zone("light-zone");
+        const zone = profiler.zone("light-zone");
         defer zone.end();
 
         const payload = try tracked_allocator.alloc(u8, 64);
@@ -237,14 +237,14 @@ test "report max rows truncates sorted sections" {
 }
 
 test "process-wide profiler records zones between start and stop" {
-    var ignored = snitch.zone("before-start");
+    const ignored = snitch.zone("before-start");
     ignored.end();
 
     snitch.start(std.testing.io, std.testing.allocator);
     defer snitch.stop();
 
     {
-        var zone = snitch.zone("global-zone");
+        const zone = snitch.zone("global-zone");
         defer zone.end();
 
         if (snitch.memory_enabled) {
@@ -277,6 +277,6 @@ test "process-wide zones are ignored after stop" {
     snitch.stop();
     try std.testing.expect(snitch.defaultProfiler() == null);
 
-    var zone = snitch.zone("after-stop");
+    const zone = snitch.zone("after-stop");
     zone.end();
 }
