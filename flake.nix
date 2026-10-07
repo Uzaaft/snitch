@@ -1,5 +1,5 @@
 {
-  description = "Zig project template";
+  description = "snitch: a build-time switchable profiler for Zig";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -26,10 +26,10 @@
       pkgs,
       system,
     }: let
-      zig = pkgs.zig_0_15;
+      zig = pkgs.zig_0_17;
     in {
       default = pkgs.stdenv.mkDerivation {
-        name = "zig-project";
+        name = "snitch";
         src = ./.;
         nativeBuildInputs = [zig];
 
@@ -47,7 +47,7 @@
       pkgs,
       system,
     }: let
-      zig = pkgs.zig_0_15;
+      zig = pkgs.zig_0_17;
       zls = pkgs.zls;
       zigdoc = zigdoc-nix.packages.${system}.default;
       ziglint = ziglint-nix.packages.${system}.default;

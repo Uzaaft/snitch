@@ -1,65 +1,63 @@
-//! Snitch is a tiny profiling helper for code you suspect is on the hot path.
+//! Snitch is a small profiler for code you suspect is on the hot path.
 //!
-//! Keep instrumentation calls in source code all the time. Build flags decide
-//! whether those calls collect metrics or collapse to inline no-op code.
+//! Instrumentation calls stay in your source permanently. Build flags decide
+//! whether they record metrics or compile down to nothing.
 //!
-//! # Build Flags
+//! # Build flags
 //!
-//! Configure these from `build.zig`:
+//! - `-Dsnitch`: master switch (default `false`).
+//! - `-Dsnitch-timing`: record execution time (default `true`).
+//! - `-Dsnitch-memory`: record allocations (default `true`).
+//! - `-Dsnitch-percentile`: percentile column in reports, 1-100 (default `85`).
+//! - `-Dsnitch-max-rows`: rows per report section, `0` for all (default `0`).
 //!
-//! - `-Dsnitch=true`: master switch.
-//! - `-Dsnitch-timing=true|false`: timing metrics group.
-//! - `-Dsnitch-memory=true|false`: allocation metrics group.
-//! - `-Dsnitch-percentile=95`: percentile column used in reports.
-//! - `-Dsnitch-max-rows=20`: max rows per section (`0` means unlimited).
+//! # Notes
 //!
-//! The deprecated alias `-Dhotpath=true` is still accepted in `build.zig`.
-//!
-//! # Usage Notes
-//!
-//! - `zone`, `measureCall`, and `measureBlock` use `comptime` labels.
-//! - `zoneHere`, `measureCallHere`, and `measureBlockHere` require explicit
-//!   `@src()` on Zig 0.15.
-//! - Memory metrics only track allocations made through `profiler.allocator()`.
-//! - Allocation counters are profiler-wide, so overlapping concurrent zones can
-//!   include each other's allocations.
+//! - Zone labels are comptime strings.
+//! - The `*Here` variants label zones with the caller's file and line. Pass
+//!   `@src()` explicitly; Zig cannot capture the caller's location for you.
+//! - Memory metrics count allocations made through `snitch.allocator()` (or
+//!   `Profiler.allocator()`) on the thread that ran the zone. End a zone on the thread that started it.
+//! - Percentiles come from a fixed-size histogram and may read up to 1/64
+//!   (about 1.6%) above the true value. Averages and totals are exact.
+//! - A program can use at most 1024 distinct zone labels.
 //!
 //! # Example
 //!
 //! ```zig
-//! const hotpath = @import("hotpath");
 //! const std = @import("std");
+//! const snitch = @import("snitch");
 //!
-//! var profiler = hotpath.Profiler.init(std.heap.page_allocator);
-//! defer profiler.deinit();
+//! pub fn main(init: std.process.Init) !void {
+//!     snitch.start(init.io, init.gpa);
+//!     defer snitch.finish(); // prints the report to stderr
 //!
-//! const tracked_allocator = profiler.allocator();
+//!     {
+//!         var zone = snitch.zone("db-query");
+//!         defer zone.end();
 //!
-//! var zone = profiler.zone("db-query");
-//! defer zone.end();
+//!         const tracked_allocator = snitch.allocator();
+//!         const payload = try tracked_allocator.alloc(u8, 256);
+//!         defer tracked_allocator.free(payload);
+//!     }
 //!
-//! _ = hotpath.measureCall(&profiler, "handler", handlerFn, .{ arg1, arg2 });
-//! _ = hotpath.measureCallHere(&profiler, handlerFn, .{ arg1, arg2 }, @src());
-//! _ = hotpath.measureBlockHere(&profiler, struct {
-//!     fn run() void {}
-//! }.run, @src());
-//!
-//! const payload = try tracked_allocator.alloc(u8, 256);
-//! defer tracked_allocator.free(payload);
-//!
-//! try hotpath.writeReportStdout(&profiler, 4_096);
+//!     _ = snitch.measureCall("handler", handler, .{ arg1, arg2 });
+//!     _ = snitch.measureCallHere(handler, .{ arg1, arg2 }, @src());
+//!     _ = snitch.measureBlockHere(struct {
+//!         fn run() void {}
+//!     }.run, @src());
+//! }
 //! ```
 const std = @import("std");
 const build_options = @import("build_options");
-const log = std.log.scoped(.snitch);
 
 /// True when instrumentation is enabled with `-Dsnitch=true`.
 pub const enabled = build_options.snitch;
 
-/// True when timing metrics are enabled under the master snitch flag.
+/// True when snitch is enabled and timing metrics are on.
 pub const timing_enabled = enabled and build_options.snitch_timing;
 
-/// True when memory metrics are enabled under the master snitch flag.
+/// True when snitch is enabled and memory metrics are on.
 pub const memory_enabled = enabled and build_options.snitch_memory;
 
 /// Percentile shown in report columns, set via `-Dsnitch-percentile`.
@@ -74,880 +72,863 @@ comptime {
     }
 }
 
-const enabled_impl = struct {
-    const AllocationSnapshot = struct {
-        bytes: u64,
-        calls: u64,
-    };
-
-    const TrackingAllocator = struct {
-        parent: std.mem.Allocator,
-        total_allocated_bytes: u64 = 0,
-        total_allocation_calls: u64 = 0,
-
-        fn init(parent: std.mem.Allocator) TrackingAllocator {
-            return .{ .parent = parent };
-        }
-
-        fn allocator(self: *TrackingAllocator) std.mem.Allocator {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .alloc = alloc,
-                    .resize = resize,
-                    .remap = remap,
-                    .free = free,
-                },
-            };
-        }
-
-        fn snapshot(self: *const TrackingAllocator) AllocationSnapshot {
-            return .{
-                .bytes = @atomicLoad(u64, &self.total_allocated_bytes, .seq_cst),
-                .calls = @atomicLoad(u64, &self.total_allocation_calls, .seq_cst),
-            };
-        }
-
-        fn record(self: *TrackingAllocator, bytes: u64, calls: u64) void {
-            if (bytes > 0) {
-                _ = @atomicRmw(u64, &self.total_allocated_bytes, .Add, bytes, .seq_cst);
-            }
-
-            if (calls > 0) {
-                _ = @atomicRmw(u64, &self.total_allocation_calls, .Add, calls, .seq_cst);
-            }
-        }
-
-        fn recordGrowth(self: *TrackingAllocator, old_len: usize, new_len: usize) void {
-            if (new_len <= old_len) {
-                return;
-            }
-
-            const growth = new_len - old_len;
-            std.debug.assert(growth <= std.math.maxInt(u64));
-            self.record(@intCast(growth), 1);
-        }
-
-        fn alloc(
-            context: *anyopaque,
-            len: usize,
-            alignment: std.mem.Alignment,
-            return_address: usize,
-        ) ?[*]u8 {
-            const self: *TrackingAllocator = @ptrCast(@alignCast(context));
-            const pointer = self.parent.rawAlloc(len, alignment, return_address);
-
-            if (pointer != null) {
-                std.debug.assert(len <= std.math.maxInt(u64));
-                self.record(@intCast(len), 1);
-            }
-
-            return pointer;
-        }
-
-        fn resize(
-            context: *anyopaque,
-            memory: []u8,
-            alignment: std.mem.Alignment,
-            new_len: usize,
-            return_address: usize,
-        ) bool {
-            const self: *TrackingAllocator = @ptrCast(@alignCast(context));
-            const resized = self.parent.rawResize(memory, alignment, new_len, return_address);
-
-            if (resized) {
-                self.recordGrowth(memory.len, new_len);
-            }
-
-            return resized;
-        }
-
-        fn remap(
-            context: *anyopaque,
-            memory: []u8,
-            alignment: std.mem.Alignment,
-            new_len: usize,
-            return_address: usize,
-        ) ?[*]u8 {
-            const self: *TrackingAllocator = @ptrCast(@alignCast(context));
-            const pointer = self.parent.rawRemap(memory, alignment, new_len, return_address);
-
-            if (pointer != null) {
-                self.recordGrowth(memory.len, new_len);
-            }
-
-            return pointer;
-        }
-
-        fn free(
-            context: *anyopaque,
-            memory: []u8,
-            alignment: std.mem.Alignment,
-            return_address: usize,
-        ) void {
-            const self: *TrackingAllocator = @ptrCast(@alignCast(context));
-            self.parent.rawFree(memory, alignment, return_address);
-        }
-    };
-
-    const Sample = struct {
-        calls: u64 = 0,
-        total_ns: u128 = 0,
-        total_alloc_bytes: u128 = 0,
-        total_alloc_calls: u128 = 0,
-        durations_ns: std.ArrayList(u64) = .{},
-        alloc_bytes_values: std.ArrayList(u64) = .{},
-        alloc_call_values: std.ArrayList(u64) = .{},
-
-        fn averagePerCall(total: u128, calls: u64) u64 {
-            std.debug.assert(calls > 0);
-            const average = total / calls;
-            std.debug.assert(average <= std.math.maxInt(u64));
-            return @intCast(average);
-        }
-
-        fn observe(
-            self: *Sample,
-            allocator: std.mem.Allocator,
-            elapsed_ns: u64,
-            alloc_bytes: u64,
-            alloc_calls: u64,
-        ) !void {
-            std.debug.assert(elapsed_ns <= std.math.maxInt(u64));
-
-            self.calls += 1;
-
-            if (timing_enabled) {
-                try self.durations_ns.append(allocator, elapsed_ns);
-                self.total_ns += elapsed_ns;
-            }
-
-            if (memory_enabled) {
-                try self.alloc_bytes_values.append(allocator, alloc_bytes);
-                try self.alloc_call_values.append(allocator, alloc_calls);
-                self.total_alloc_bytes += alloc_bytes;
-                self.total_alloc_calls += alloc_calls;
-            }
-        }
-
-        fn averageDurationNs(self: Sample) u64 {
-            if (!timing_enabled) {
-                return 0;
-            }
-
-            return averagePerCall(self.total_ns, self.calls);
-        }
-
-        fn averageAllocBytes(self: Sample) u64 {
-            if (!memory_enabled) {
-                return 0;
-            }
-
-            return averagePerCall(self.total_alloc_bytes, self.calls);
-        }
-
-        fn averageAllocCalls(self: Sample) u64 {
-            if (!memory_enabled) {
-                return 0;
-            }
-
-            return averagePerCall(self.total_alloc_calls, self.calls);
-        }
-
-        fn deinit(self: *Sample, allocator: std.mem.Allocator) void {
-            self.durations_ns.deinit(allocator);
-            self.alloc_bytes_values.deinit(allocator);
-            self.alloc_call_values.deinit(allocator);
-            self.* = undefined;
-        }
-    };
-
-    const MetricTableRow = struct {
-        label: []const u8,
-        calls: u64,
-        avg: u64,
-        p85: u64,
-        total: u64,
-        total_exact: u128,
-    };
-
-    const TableWidths = struct {
-        metric: usize,
-        calls: usize,
-        avg: usize,
-        p85: usize,
-        total: usize,
-        percent_total: usize,
-    };
-
-    const MetricKind = enum {
-        timing,
-        alloc_bytes,
-        alloc_count,
-    };
-
-    /// Stateful profiler that aggregates timing and allocation metrics by zone.
-    pub const ProfilerType = struct {
-        base_allocator: std.mem.Allocator,
-        tracking_allocator_state: TrackingAllocator,
-        mutex: std.Thread.Mutex = .{},
-        metrics: std.StringHashMapUnmanaged(Sample) = .{},
-
-        /// Initialize a profiler with the allocator used for internal storage.
-        pub fn init(base_allocator: std.mem.Allocator) callconv(callingConvention()) ProfilerType {
-            return .{
-                .base_allocator = base_allocator,
-                .tracking_allocator_state = TrackingAllocator.init(base_allocator),
-            };
-        }
-
-        /// Allocator to use from instrumented code when memory metrics are needed.
-        pub fn allocator(self: *ProfilerType) callconv(callingConvention()) std.mem.Allocator {
-            if (memory_enabled) {
-                return self.tracking_allocator_state.allocator();
-            }
-
-            return self.base_allocator;
-        }
-
-        /// Release all internal metric storage.
-        pub fn deinit(self: *ProfilerType) callconv(callingConvention()) void {
-            var iterator = self.metrics.iterator();
-            while (iterator.next()) |entry| {
-                self.base_allocator.free(entry.key_ptr.*);
-                entry.value_ptr.deinit(self.base_allocator);
-            }
-
-            self.metrics.deinit(self.base_allocator);
-            self.* = undefined;
-        }
-
-        /// Start a labeled profiling zone.
-        pub fn zone(self: *ProfilerType, comptime label: []const u8) callconv(callingConvention()) ZoneType {
-            std.debug.assert(label.len > 0);
-
-            const alloc_snapshot = if (memory_enabled)
-                self.tracking_allocator_state.snapshot()
-            else
-                AllocationSnapshot{ .bytes = 0, .calls = 0 };
-
-            return .{
-                .profiler = self,
-                .label = label,
-                .start_ns = std.time.nanoTimestamp(),
-                .start_alloc_bytes = alloc_snapshot.bytes,
-                .start_alloc_calls = alloc_snapshot.calls,
-                .finished = false,
-            };
-        }
-
-        /// Write the profiling report in an ASCII table format.
-        pub fn writeReport(self: *ProfilerType, writer: anytype) callconv(callingConvention()) !void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
-            const row_count = self.metrics.count();
-            try writer.print("[snitch] zones={d}\n\n", .{row_count});
-
-            if (row_count == 0) {
-                log.info("report requested with zero measured zones", .{});
-                try writer.writeAll("(no measurements)\n");
-                return;
-            }
-
-            if (!timing_enabled and !memory_enabled) {
-                log.warn("snitch enabled but both metric groups are disabled", .{});
-                try writer.writeAll("snitch is enabled, but both snitch-timing and snitch-memory are disabled.\n");
-                return;
-            }
-
-            const metric_rows = try self.base_allocator.alloc(MetricTableRow, row_count);
-            defer self.base_allocator.free(metric_rows);
-
-            const timing_percentile_header = std.fmt.comptimePrint("P{d} ns", .{percentile_target});
-            const alloc_bytes_percentile_header = std.fmt.comptimePrint("P{d} bytes", .{percentile_target});
-            const alloc_count_percentile_header = std.fmt.comptimePrint("P{d} allocs", .{percentile_target});
-
-            if (timing_enabled) {
-                try renderMetricSection(
-                    self,
-                    writer,
-                    metric_rows,
-                    .timing,
-                    "snitch-timing - Function execution time metrics.",
-                    "Avg ns",
-                    timing_percentile_header,
-                    "Total ns",
-                );
-            }
-
-            if (memory_enabled) {
-                if (timing_enabled) {
-                    try writer.writeByte('\n');
-                }
-
-                try renderMetricSection(
-                    self,
-                    writer,
-                    metric_rows,
-                    .alloc_bytes,
-                    "snitch-memory-bytes - Cumulative allocation bytes during each function call.",
-                    "Avg bytes",
-                    alloc_bytes_percentile_header,
-                    "Total bytes",
-                );
-                try writer.writeByte('\n');
-
-                try renderMetricSection(
-                    self,
-                    writer,
-                    metric_rows,
-                    .alloc_count,
-                    "snitch-memory-count - Allocation call count during each function call.",
-                    "Avg allocs",
-                    alloc_count_percentile_header,
-                    "Total allocs",
-                );
-            }
-        }
-
-        fn record(
-            self: *ProfilerType,
-            label: []const u8,
-            elapsed_ns: u64,
-            alloc_bytes: u64,
-            alloc_calls: u64,
-        ) void {
-            std.debug.assert(label.len > 0);
-            std.debug.assert(elapsed_ns <= std.math.maxInt(u64));
-
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
-            const get_or_put = self.metrics.getOrPut(self.base_allocator, label) catch |err| {
-                @panic(@errorName(err));
-            };
-
-            if (!get_or_put.found_existing) {
-                const owned_label = self.base_allocator.dupe(u8, label) catch |err| {
-                    @panic(@errorName(err));
-                };
-
-                get_or_put.key_ptr.* = owned_label;
-                get_or_put.value_ptr.* = .{};
-            }
-
-            get_or_put.value_ptr.observe(
-                self.base_allocator,
-                elapsed_ns,
-                alloc_bytes,
-                alloc_calls,
-            ) catch |err| {
-                @panic(@errorName(err));
-            };
-        }
-    };
-
-    /// Handle representing an in-progress zone measurement.
-    pub const ZoneType = struct {
-        profiler: *ProfilerType,
-        label: []const u8,
-        start_ns: i128,
-        start_alloc_bytes: u64,
-        start_alloc_calls: u64,
-        finished: bool,
-
-        /// Finish a zone and commit its sample into profiler aggregates.
-        pub fn end(self: *ZoneType) callconv(callingConvention()) void {
-            std.debug.assert(!self.finished);
-
-            const now_ns = std.time.nanoTimestamp();
-            const elapsed_ns = now_ns - self.start_ns;
-            std.debug.assert(elapsed_ns >= 0);
-            std.debug.assert(elapsed_ns <= std.math.maxInt(u64));
-
-            const alloc_bytes, const alloc_calls = if (memory_enabled) blk: {
-                const alloc_snapshot = self.profiler.tracking_allocator_state.snapshot();
-                std.debug.assert(alloc_snapshot.bytes >= self.start_alloc_bytes);
-                std.debug.assert(alloc_snapshot.calls >= self.start_alloc_calls);
-
-                break :blk .{
-                    alloc_snapshot.bytes - self.start_alloc_bytes,
-                    alloc_snapshot.calls - self.start_alloc_calls,
-                };
-            } else .{ 0, 0 };
-
-            self.profiler.record(self.label, @intCast(elapsed_ns), alloc_bytes, alloc_calls);
-            self.finished = true;
-        }
-    };
-
-    pub fn measureCall(
-        profiler: *ProfilerType,
-        comptime label: []const u8,
-        function: anytype,
-        args: anytype,
-    ) callconv(callingConvention()) @TypeOf(@call(.auto, function, args)) {
-        var measurement_zone = profiler.zone(label);
-        defer measurement_zone.end();
-
-        return @call(.auto, function, args);
-    }
-
-    pub fn measureBlock(
-        profiler: *ProfilerType,
-        comptime label: []const u8,
-        block: anytype,
-    ) callconv(callingConvention()) @TypeOf(block()) {
-        var measurement_zone = profiler.zone(label);
-        defer measurement_zone.end();
-
-        return block();
-    }
-
-    fn writeMetricTable(
-        writer: anytype,
-        title: []const u8,
-        rows: []const MetricTableRow,
-        total_exact: u128,
-        avg_header: []const u8,
-        p85_header: []const u8,
-        total_header: []const u8,
-    ) !void {
-        try writer.writeAll(title);
-        try writer.writeByte('\n');
-
-        const visible_rows = limitRows(rows);
-        const widths = computeTableWidths(visible_rows, avg_header, p85_header, total_header);
-        try writeSeparator(writer, widths);
-        try writeHeader(writer, widths, avg_header, p85_header, total_header);
-        try writeSeparator(writer, widths);
-
-        for (visible_rows) |row| {
-            try writeMetricRow(writer, widths, row, total_exact);
-        }
-
-        try writeSeparator(writer, widths);
-
-        if (visible_rows.len < rows.len) {
-            const hidden_rows = rows.len - visible_rows.len;
-            log.info("section truncated: showing {d} of {d} rows", .{ visible_rows.len, rows.len });
-            try writer.print(
-                "(truncated {d} rows, set -Dsnitch-max-rows=0 for all rows)\n",
-                .{hidden_rows},
-            );
-        }
-    }
-
-    fn renderMetricSection(
-        self: *ProfilerType,
-        writer: anytype,
-        rows: []MetricTableRow,
-        comptime kind: MetricKind,
-        title: []const u8,
-        avg_header: []const u8,
-        p85_header: []const u8,
-        total_header: []const u8,
-    ) !void {
-        const total_exact = collectMetricRows(self, rows, kind);
-        std.sort.heap(MetricTableRow, rows, {}, metricRowLessThan);
-        try writeMetricTable(writer, title, rows, total_exact, avg_header, p85_header, total_header);
-    }
-
-    fn collectMetricRows(
-        self: *ProfilerType,
-        rows: []MetricTableRow,
-        comptime kind: MetricKind,
-    ) u128 {
-        var total_exact: u128 = 0;
-        var row_index: usize = 0;
-        var iterator = self.metrics.iterator();
-
-        while (iterator.next()) |entry| {
-            const sample = entry.value_ptr.*;
-            std.debug.assert(sample.calls > 0);
-            std.debug.assert(row_index < rows.len);
-
-            const metric_row: MetricTableRow = switch (kind) {
-                .timing => .{
-                    .label = entry.key_ptr.*,
-                    .calls = sample.calls,
-                    .avg = sample.averageDurationNs(),
-                    .p85 = percentileNearestRank(self.base_allocator, sample.durations_ns.items, percentile_target),
-                    .total = saturatingToU64(sample.total_ns),
-                    .total_exact = sample.total_ns,
-                },
-                .alloc_bytes => .{
-                    .label = entry.key_ptr.*,
-                    .calls = sample.calls,
-                    .avg = sample.averageAllocBytes(),
-                    .p85 = percentileNearestRank(self.base_allocator, sample.alloc_bytes_values.items, percentile_target),
-                    .total = saturatingToU64(sample.total_alloc_bytes),
-                    .total_exact = sample.total_alloc_bytes,
-                },
-                .alloc_count => .{
-                    .label = entry.key_ptr.*,
-                    .calls = sample.calls,
-                    .avg = sample.averageAllocCalls(),
-                    .p85 = percentileNearestRank(self.base_allocator, sample.alloc_call_values.items, percentile_target),
-                    .total = saturatingToU64(sample.total_alloc_calls),
-                    .total_exact = sample.total_alloc_calls,
-                },
-            };
-
-            rows[row_index] = metric_row;
-            total_exact += metric_row.total_exact;
-            row_index += 1;
-        }
-
-        std.debug.assert(row_index == rows.len);
-        return total_exact;
-    }
-
-    fn limitRows(rows: []const MetricTableRow) []const MetricTableRow {
-        if (report_max_rows == 0) {
-            return rows;
-        }
-
-        return rows[0..@min(rows.len, report_max_rows)];
-    }
-
-    fn computeTableWidths(
-        rows: []const MetricTableRow,
-        avg_header: []const u8,
-        p85_header: []const u8,
-        total_header: []const u8,
-    ) TableWidths {
-        const max_metric_width = 40;
-
-        var widths = TableWidths{
-            .metric = "Metric".len,
-            .calls = "Calls".len,
-            .avg = avg_header.len,
-            .p85 = p85_header.len,
-            .total = total_header.len,
-            .percent_total = "% Total".len,
+/// Upper bound on distinct zone labels in one program.
+const max_labels = 1024;
+
+// Allocation counters for the current thread. A zone reads them when it
+// starts and ends, so allocations on other threads never leak into it.
+// Every profiler shares them, so a zone also counts allocations made on
+// its thread through a different profiler's allocator.
+threadlocal var thread_alloc_bytes: u64 = 0;
+threadlocal var thread_alloc_calls: u64 = 0;
+
+const TrackingAllocator = struct {
+    parent: std.mem.Allocator,
+
+    fn allocator(self: *TrackingAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
         };
-
-        for (rows) |row| {
-            widths.metric = @max(widths.metric, @min(max_metric_width, row.label.len));
-            widths.calls = @max(widths.calls, decimalDigits(row.calls));
-            widths.avg = @max(widths.avg, decimalDigits(row.avg));
-            widths.p85 = @max(widths.p85, decimalDigits(row.p85));
-            widths.total = @max(widths.total, decimalDigits(row.total));
-        }
-
-        widths.percent_total = @max(widths.percent_total, "100.00%".len);
-        return widths;
     }
 
-    fn metricRowLessThan(_: void, lhs: MetricTableRow, rhs: MetricTableRow) bool {
-        if (lhs.total_exact != rhs.total_exact) {
-            return lhs.total_exact > rhs.total_exact;
-        }
-
-        return std.mem.lessThan(u8, lhs.label, rhs.label);
+    fn record(bytes: usize) void {
+        thread_alloc_bytes +%= bytes;
+        thread_alloc_calls +%= 1;
     }
 
-    fn writeSeparator(writer: anytype, widths: TableWidths) !void {
-        try writer.writeByte('+');
-        try writeRepeated(writer, '-', widths.metric + 2);
-        try writer.writeByte('+');
-        try writeRepeated(writer, '-', widths.calls + 2);
-        try writer.writeByte('+');
-        try writeRepeated(writer, '-', widths.avg + 2);
-        try writer.writeByte('+');
-        try writeRepeated(writer, '-', widths.p85 + 2);
-        try writer.writeByte('+');
-        try writeRepeated(writer, '-', widths.total + 2);
-        try writer.writeByte('+');
-        try writeRepeated(writer, '-', widths.percent_total + 2);
-        try writer.writeAll("+\n");
+    fn alloc(
+        context: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *TrackingAllocator = @ptrCast(@alignCast(context));
+        const pointer = self.parent.rawAlloc(len, alignment, return_address);
+
+        if (pointer != null) {
+            record(len);
+        }
+
+        return pointer;
     }
 
-    fn writeHeader(
-        writer: anytype,
-        widths: TableWidths,
-        avg_header: []const u8,
-        p85_header: []const u8,
-        total_header: []const u8,
-    ) !void {
-        try writer.writeAll("| ");
-        try writeCellLeft(writer, "Metric", widths.metric, false);
-        try writer.writeAll(" | ");
-        try writeCellRight(writer, "Calls", widths.calls);
-        try writer.writeAll(" | ");
-        try writeCellRight(writer, avg_header, widths.avg);
-        try writer.writeAll(" | ");
-        try writeCellRight(writer, p85_header, widths.p85);
-        try writer.writeAll(" | ");
-        try writeCellRight(writer, total_header, widths.total);
-        try writer.writeAll(" | ");
-        try writeCellRight(writer, "% Total", widths.percent_total);
-        try writer.writeAll(" |\n");
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) bool {
+        const self: *TrackingAllocator = @ptrCast(@alignCast(context));
+        const resized = self.parent.rawResize(memory, alignment, new_len, return_address);
+
+        if (resized and new_len > memory.len) {
+            record(new_len - memory.len);
+        }
+
+        return resized;
     }
 
-    fn writeMetricRow(
-        writer: anytype,
-        widths: TableWidths,
-        row: MetricTableRow,
-        total_exact: u128,
-    ) !void {
-        var calls_buffer: [32]u8 = undefined;
-        var avg_buffer: [32]u8 = undefined;
-        var p85_buffer: [32]u8 = undefined;
-        var total_buffer: [32]u8 = undefined;
-        var percent_buffer: [32]u8 = undefined;
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *TrackingAllocator = @ptrCast(@alignCast(context));
+        const pointer = self.parent.rawRemap(memory, alignment, new_len, return_address);
 
-        const calls_text = std.fmt.bufPrint(&calls_buffer, "{d}", .{row.calls}) catch unreachable;
-        const avg_text = std.fmt.bufPrint(&avg_buffer, "{d}", .{row.avg}) catch unreachable;
-        const p85_text = std.fmt.bufPrint(&p85_buffer, "{d}", .{row.p85}) catch unreachable;
-        const total_text = std.fmt.bufPrint(&total_buffer, "{d}", .{row.total}) catch unreachable;
-        const percent_text = formatPercent(row.total_exact, total_exact, &percent_buffer);
+        if (pointer != null and new_len > memory.len) {
+            record(new_len - memory.len);
+        }
 
-        try writer.writeAll("| ");
-        try writeCellLeft(writer, row.label, widths.metric, true);
-        try writer.writeAll(" | ");
-        try writeCellRight(writer, calls_text, widths.calls);
-        try writer.writeAll(" | ");
-        try writeCellRight(writer, avg_text, widths.avg);
-        try writer.writeAll(" | ");
-        try writeCellRight(writer, p85_text, widths.p85);
-        try writer.writeAll(" | ");
-        try writeCellRight(writer, total_text, widths.total);
-        try writer.writeAll(" | ");
-        try writeCellRight(writer, percent_text, widths.percent_total);
-        try writer.writeAll(" |\n");
+        return pointer;
     }
 
-    fn formatPercent(part: u128, whole: u128, buffer: *[32]u8) []const u8 {
-        if (whole == 0) {
-            return "0.00%";
-        }
-
-        const ratio = @as(f64, @floatFromInt(part)) / @as(f64, @floatFromInt(whole));
-        const percent = ratio * 100.0;
-        return std.fmt.bufPrint(buffer, "{d:.2}%", .{percent}) catch unreachable;
-    }
-
-    fn percentileNearestRank(
-        allocator: std.mem.Allocator,
-        values: []const u64,
-        percentile: u8,
-    ) u64 {
-        std.debug.assert(percentile <= 100);
-
-        if (values.len == 0) {
-            return 0;
-        }
-
-        const sorted = allocator.dupe(u64, values) catch |err| {
-            @panic(@errorName(err));
-        };
-        defer allocator.free(sorted);
-
-        std.sort.heap(u64, sorted, {}, std.sort.asc(u64));
-
-        const percentile_usize: usize = percentile;
-        std.debug.assert(values.len <= (std.math.maxInt(usize) - 99) / 100);
-        var rank = (values.len * percentile_usize + 99) / 100;
-        if (rank == 0) {
-            rank = 1;
-        }
-        if (rank > values.len) {
-            rank = values.len;
-        }
-
-        return sorted[rank - 1];
-    }
-
-    fn saturatingToU64(value: u128) u64 {
-        std.debug.assert(value <= std.math.maxInt(u128));
-        std.debug.assert(std.math.maxInt(u64) <= std.math.maxInt(u128));
-
-        if (value > std.math.maxInt(u64)) {
-            return std.math.maxInt(u64);
-        }
-
-        return @intCast(value);
-    }
-
-    fn writeCellLeft(writer: anytype, text: []const u8, width: usize, truncate: bool) !void {
-        std.debug.assert(width > 0);
-
-        if (text.len <= width) {
-            try writer.writeAll(text);
-            try writeRepeated(writer, ' ', width - text.len);
-            return;
-        }
-
-        if (!truncate or width <= 3) {
-            try writer.writeAll(text[0..width]);
-            return;
-        }
-
-        const preserved_len = width - 3;
-        try writer.writeAll(text[0..preserved_len]);
-        try writer.writeAll("...");
-    }
-
-    fn writeCellRight(writer: anytype, text: []const u8, width: usize) !void {
-        std.debug.assert(width > 0);
-
-        if (text.len >= width) {
-            try writer.writeAll(text);
-            return;
-        }
-
-        try writeRepeated(writer, ' ', width - text.len);
-        try writer.writeAll(text);
-    }
-
-    fn writeRepeated(writer: anytype, byte: u8, count: usize) !void {
-        var index: usize = 0;
-        while (index < count) : (index += 1) {
-            try writer.writeByte(byte);
-        }
-    }
-
-    fn decimalDigits(value: u64) usize {
-        var digits: usize = 1;
-        var remaining = value;
-
-        while (remaining >= 10) {
-            remaining /= 10;
-            digits += 1;
-        }
-
-        return digits;
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *TrackingAllocator = @ptrCast(@alignCast(context));
+        self.parent.rawFree(memory, alignment, return_address);
     }
 };
 
-const disabled_impl = struct {
-    /// API-compatible no-op profiler used when snitch is disabled.
-    pub const ProfilerType = struct {
-        base_allocator: std.mem.Allocator,
+/// Process-wide list of zone labels. Each label is registered on first use
+/// and its index picks the profiler slot that stores its metrics.
+const registry = struct {
+    var lock: std.atomic.Mutex = .unlocked;
+    var names: [max_labels][]const u8 = undefined;
+    var len: std.atomic.Value(u32) = .init(0);
 
-        pub fn init(base_allocator: std.mem.Allocator) callconv(callingConvention()) ProfilerType {
-            return .{ .base_allocator = base_allocator };
+    fn register(name: []const u8) u32 {
+        while (!lock.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+        defer lock.unlock();
+
+        const count = len.load(.monotonic);
+        for (names[0..count], 0..) |existing, index| {
+            if (std.mem.eql(u8, existing, name)) {
+                return @intCast(index);
+            }
         }
 
-        pub fn allocator(self: *ProfilerType) callconv(callingConvention()) std.mem.Allocator {
-            return self.base_allocator;
+        if (count == max_labels) {
+            @panic(std.fmt.comptimePrint("snitch supports at most {d} distinct zone labels", .{max_labels}));
         }
 
-        pub fn deinit(self: *ProfilerType) callconv(callingConvention()) void {
-            _ = self;
-        }
-
-        pub fn zone(self: *ProfilerType, comptime label: []const u8) callconv(callingConvention()) ZoneType {
-            _ = self;
-            _ = label;
-            return .{};
-        }
-
-        pub fn writeReport(self: *ProfilerType, writer: anytype) callconv(callingConvention()) !void {
-            _ = self;
-            _ = writer;
-        }
-    };
-
-    pub const ZoneType = struct {
-        pub fn end(self: *ZoneType) callconv(callingConvention()) void {
-            _ = self;
-        }
-    };
-
-    pub fn measureCall(
-        profiler: *ProfilerType,
-        comptime label: []const u8,
-        function: anytype,
-        args: anytype,
-    ) callconv(callingConvention()) @TypeOf(@call(.auto, function, args)) {
-        _ = profiler;
-        _ = label;
-        return @call(.auto, function, args);
+        names[count] = name;
+        len.store(count + 1, .release);
+        return count;
     }
 
-    pub fn measureBlock(
-        profiler: *ProfilerType,
-        comptime label: []const u8,
-        block: anytype,
-    ) callconv(callingConvention()) @TypeOf(block()) {
-        _ = profiler;
-        _ = label;
-        return block();
+    fn labels() []const []const u8 {
+        return names[0..len.load(.acquire)];
     }
 };
 
-/// Inline in disabled mode so instrumentation calls compile away.
+/// Index of `label` in the registry. Only the first call for each label
+/// takes the registry lock; later calls read a cached value.
+fn labelIndex(comptime label: []const u8) u32 {
+    const unregistered = std.math.maxInt(u32);
+    // Referencing `label` makes this a distinct type, and so a distinct
+    // static, for every label.
+    const cache = struct {
+        const name = label;
+        var index: std.atomic.Value(u32) = .init(unregistered);
+    };
+
+    const cached = cache.index.load(.monotonic);
+    if (cached != unregistered) {
+        return cached;
+    }
+
+    const index = registry.register(label);
+    cache.index.store(index, .monotonic);
+    return index;
+}
+
+/// Fixed-size, lock-free histogram of u64 values.
+///
+/// Values below 128 get one bucket each. Each power of two above that is
+/// split into 64 buckets, so a percentile read from a bucket's upper bound
+/// is at most 1/64 (about 1.6%) above the true value.
+const Histogram = struct {
+    const sub_bits = 7;
+    const sub_count = 1 << sub_bits;
+    const half_count = sub_count / 2;
+    const bucket_count = sub_count + (64 - sub_bits) * half_count;
+
+    buckets: [bucket_count]u64 = @splat(0),
+    total: u64 = 0,
+    max: u64 = 0,
+
+    fn bucketIndex(value: u64) usize {
+        if (value < sub_count) {
+            return @intCast(value);
+        }
+
+        const shift = std.math.log2_int(u64, value) - (sub_bits - 1);
+        const mantissa: usize = @intCast(value >> shift);
+        return sub_count + (@as(usize, shift) - 1) * half_count + (mantissa - half_count);
+    }
+
+    fn bucketUpperBound(index: usize) u64 {
+        if (index < sub_count) {
+            return index;
+        }
+
+        const offset = index - sub_count;
+        const shift: u6 = @intCast(offset / half_count + 1);
+        const mantissa: u64 = offset % half_count + half_count;
+        return (mantissa << shift) | ((@as(u64, 1) << shift) - 1);
+    }
+
+    fn observe(self: *Histogram, value: u64) void {
+        _ = @atomicRmw(u64, &self.buckets[bucketIndex(value)], .Add, 1, .monotonic);
+
+        // Skipping no-op updates avoids contended atomics on the common
+        // paths: zones that allocate nothing, and values below the max.
+        if (value != 0) {
+            _ = @atomicRmw(u64, &self.total, .Add, value, .monotonic);
+        }
+        if (value > @atomicLoad(u64, &self.max, .monotonic)) {
+            _ = @atomicRmw(u64, &self.max, .Max, value, .monotonic);
+        }
+    }
+
+    fn count(self: *const Histogram) u64 {
+        var sum: u64 = 0;
+        for (&self.buckets) |*bucket| {
+            sum += @atomicLoad(u64, bucket, .monotonic);
+        }
+        return sum;
+    }
+
+    /// Nearest-rank percentile, reported as the upper bound of the bucket
+    /// holding it and capped at the largest value seen.
+    fn percentile(self: *const Histogram, samples: u64, target: u8) u64 {
+        std.debug.assert(samples > 0);
+        const rank = @max(1, (samples * target + 99) / 100);
+
+        var seen: u64 = 0;
+        for (&self.buckets, 0..) |*bucket, index| {
+            seen += @atomicLoad(u64, bucket, .monotonic);
+            if (seen >= rank) {
+                return @min(bucketUpperBound(index), @atomicLoad(u64, &self.max, .monotonic));
+            }
+        }
+
+        // Buckets only grow, so `samples` (counted earlier) is always reached.
+        unreachable;
+    }
+};
+
+const TimingHistogram = if (timing_enabled) Histogram else void;
+const MemoryHistogram = if (memory_enabled) Histogram else void;
+
+/// Metrics for one label.
+const Slot = struct {
+    timing: TimingHistogram = if (timing_enabled) .{} else {},
+    alloc_bytes: MemoryHistogram = if (memory_enabled) .{} else {},
+    alloc_calls: MemoryHistogram = if (memory_enabled) .{} else {},
+
+    /// Number of recorded zones, or 0 when no metric group is enabled.
+    fn calls(self: *const Slot) u64 {
+        if (timing_enabled) return self.timing.count();
+        if (memory_enabled) return self.alloc_calls.count();
+        return 0;
+    }
+};
+
+/// Disabled builds inline every call so instrumentation compiles away.
 fn callingConvention() std.builtin.CallingConvention {
     return if (!enabled) .@"inline" else .auto;
 }
 
-const implementation = if (enabled) enabled_impl else disabled_impl;
+/// Collects metrics per zone label. Most programs can use the process-wide
+/// profiler through `start`, `zone` and `finish` instead of creating one.
+///
+/// When snitch is disabled, every method is an inlined no-op.
+pub const Profiler = struct {
+    io: std.Io,
+    base_allocator: std.mem.Allocator,
+    tracking_allocator_state: TrackingAllocator,
+    slots: if (enabled) [max_labels]?*Slot else void,
 
-/// Primary profiling handle.
-pub const Profiler = implementation.ProfilerType;
+    /// Create a profiler. `io` provides the clock; `base_allocator` holds
+    /// the profiler's own storage and must be thread-safe if zones end on
+    /// several threads.
+    pub fn init(io: std.Io, base_allocator: std.mem.Allocator) callconv(callingConvention()) Profiler {
+        return .{
+            .io = io,
+            .base_allocator = base_allocator,
+            .tracking_allocator_state = .{ .parent = base_allocator },
+            .slots = if (enabled) @splat(null) else {},
+        };
+    }
 
-/// Active measurement zone handle.
-pub const Zone = implementation.ZoneType;
+    /// Free all recorded metrics.
+    pub fn deinit(self: *Profiler) callconv(callingConvention()) void {
+        if (enabled) {
+            for (self.slots) |maybe_slot| {
+                if (maybe_slot) |slot| {
+                    self.base_allocator.destroy(slot);
+                }
+            }
+        }
 
-/// Measure a function call and return the wrapped function result.
-pub const measureCall = implementation.measureCall;
+        self.* = undefined;
+    }
 
-/// Measure an arbitrary block and return the block result.
-pub const measureBlock = implementation.measureBlock;
+    /// Allocator whose allocations count towards memory metrics. Use it in the
+    /// code you are measuring.
+    pub fn allocator(self: *Profiler) callconv(callingConvention()) std.mem.Allocator {
+        if (memory_enabled) {
+            return self.tracking_allocator_state.allocator();
+        }
 
-/// Start a zone using the callsite file and line as the label.
-pub fn zoneHere(
-    profiler: *Profiler,
-    comptime source_location: std.builtin.SourceLocation,
-) callconv(callingConvention()) Zone {
-    return profiler.zone(comptimeSourceLabel(source_location));
+        return self.base_allocator;
+    }
+
+    /// Start a zone. Call `end` on the result to record it.
+    pub fn zone(self: *Profiler, comptime label: []const u8) callconv(callingConvention()) Zone {
+        if (comptime !enabled) {
+            return .{};
+        }
+
+        return .{
+            .profiler = self,
+            .label_index = labelIndex(label),
+            .start_alloc_bytes = thread_alloc_bytes,
+            .start_alloc_calls = thread_alloc_calls,
+            .start = if (timing_enabled) .now(self.io, .awake) else {},
+        };
+    }
+
+    /// Like `zone`, labeled with the caller's file and line.
+    pub fn zoneHere(
+        self: *Profiler,
+        comptime source_location: std.builtin.SourceLocation,
+    ) callconv(callingConvention()) Zone {
+        return self.zone(comptimeSourceLabel(source_location));
+    }
+
+    /// Call `function` with `args`, measure it, and return its result.
+    pub fn measureCall(
+        self: *Profiler,
+        comptime label: []const u8,
+        function: anytype,
+        args: anytype,
+    ) callconv(callingConvention()) @TypeOf(@call(.auto, function, args)) {
+        var measurement = self.zone(label);
+        defer measurement.end();
+        return @call(.auto, function, args);
+    }
+
+    /// Like `measureCall`, labeled with the caller's file and line.
+    pub fn measureCallHere(
+        self: *Profiler,
+        function: anytype,
+        args: anytype,
+        comptime source_location: std.builtin.SourceLocation,
+    ) callconv(callingConvention()) @TypeOf(@call(.auto, function, args)) {
+        return self.measureCall(comptimeSourceLabel(source_location), function, args);
+    }
+
+    /// Run `block`, measure it, and return its result.
+    pub fn measureBlock(
+        self: *Profiler,
+        comptime label: []const u8,
+        block: anytype,
+    ) callconv(callingConvention()) @TypeOf(block()) {
+        var measurement = self.zone(label);
+        defer measurement.end();
+        return block();
+    }
+
+    /// Like `measureBlock`, labeled with the caller's file and line.
+    pub fn measureBlockHere(
+        self: *Profiler,
+        block: anytype,
+        comptime source_location: std.builtin.SourceLocation,
+    ) callconv(callingConvention()) @TypeOf(block()) {
+        return self.measureBlock(comptimeSourceLabel(source_location), block);
+    }
+
+    /// Write the report to stderr.
+    pub fn printReport(self: *Profiler) callconv(callingConvention()) !void {
+        if (comptime !enabled) {
+            return;
+        }
+
+        var buffer: [4_096]u8 = undefined;
+        var stderr_writer = std.Io.File.stderr().writer(self.io, &buffer);
+        try self.writeReport(&stderr_writer.interface);
+        try stderr_writer.interface.flush();
+    }
+
+    /// Write the report as ASCII tables.
+    pub fn writeReport(self: *Profiler, writer: *std.Io.Writer) callconv(callingConvention()) !void {
+        if (comptime !enabled) {
+            return;
+        }
+
+        const labels = registry.labels();
+        const entries = try self.base_allocator.alloc(LabeledSlot, labels.len);
+        defer self.base_allocator.free(entries);
+
+        var entry_count: usize = 0;
+        for (labels, 0..) |label, index| {
+            const slot = @atomicLoad(?*Slot, &self.slots[index], .acquire) orelse continue;
+            entries[entry_count] = .{ .label = label, .slot = slot };
+            entry_count += 1;
+        }
+
+        try writeReportEntries(self.base_allocator, writer, entries[0..entry_count]);
+    }
+
+    /// Slot for a label index, created on first use. Racing threads may
+    /// both allocate one; the loser frees its copy.
+    fn slotFor(self: *Profiler, index: u32) *Slot {
+        const target = &self.slots[index];
+        if (@atomicLoad(?*Slot, target, .acquire)) |existing| {
+            return existing;
+        }
+
+        const created = self.base_allocator.create(Slot) catch |err| {
+            @panic(@errorName(err));
+        };
+        created.* = .{};
+
+        if (@cmpxchgStrong(?*Slot, target, null, created, .acq_rel, .acquire)) |winner| {
+            self.base_allocator.destroy(created);
+            return winner.?;
+        }
+
+        return created;
+    }
+
+    fn record(self: *Profiler, label_index: u32, elapsed_ns: u64, alloc_bytes: u64, alloc_calls: u64) void {
+        const target = self.slotFor(label_index);
+
+        if (timing_enabled) {
+            target.timing.observe(elapsed_ns);
+        }
+
+        if (memory_enabled) {
+            target.alloc_bytes.observe(alloc_bytes);
+            target.alloc_calls.observe(alloc_calls);
+        }
+    }
+};
+
+/// A measurement in progress. Call `end` exactly once, on the thread that
+/// started it.
+pub const Zone = if (enabled) struct {
+    /// Null for zones started before `snitch.start`; ending them does nothing.
+    profiler: ?*Profiler,
+    label_index: u32,
+    start_alloc_bytes: u64,
+    start_alloc_calls: u64,
+    start: if (timing_enabled) std.Io.Timestamp else void,
+    finished: bool = false,
+
+    const inactive: Zone = .{
+        .profiler = null,
+        .label_index = 0,
+        .start_alloc_bytes = 0,
+        .start_alloc_calls = 0,
+        .start = undefined,
+    };
+
+    /// Stop measuring and record the sample.
+    pub fn end(self: *Zone) void {
+        std.debug.assert(!self.finished);
+        const profiler = self.profiler orelse return;
+
+        const elapsed_ns: u64 = if (timing_enabled) blk: {
+            const now = std.Io.Timestamp.now(profiler.io, .awake);
+            const elapsed = self.start.durationTo(now).toNanoseconds();
+            std.debug.assert(elapsed >= 0);
+            break :blk @intCast(elapsed);
+        } else 0;
+
+        profiler.record(
+            self.label_index,
+            elapsed_ns,
+            thread_alloc_bytes -% self.start_alloc_bytes,
+            thread_alloc_calls -% self.start_alloc_calls,
+        );
+        self.finished = true;
+    }
+} else struct {
+    pub inline fn end(_: *Zone) void {}
+};
+
+// ---------------------------------------------------------------------------
+// Report
+
+const LabeledSlot = struct {
+    label: []const u8,
+    slot: *const Slot,
+};
+
+const Section = struct {
+    title: []const u8,
+    unit: []const u8,
+    enabled: bool,
+    /// Which histogram of a slot this section reads.
+    field: []const u8,
+};
+
+const sections = [_]Section{
+    .{ .title = "snitch-timing - Execution time per call.", .unit = "ns", .enabled = timing_enabled, .field = "timing" },
+    .{ .title = "snitch-memory-bytes - Bytes allocated per call.", .unit = "bytes", .enabled = memory_enabled, .field = "alloc_bytes" },
+    .{ .title = "snitch-memory-count - Allocations per call.", .unit = "allocs", .enabled = memory_enabled, .field = "alloc_calls" },
+};
+
+const Row = struct {
+    label: []const u8,
+    calls: u64,
+    avg: u64,
+    percentile: u64,
+    total: u64,
+
+    fn moreTotalFirst(_: void, lhs: Row, rhs: Row) bool {
+        if (lhs.total != rhs.total) {
+            return lhs.total > rhs.total;
+        }
+        return std.mem.lessThan(u8, lhs.label, rhs.label);
+    }
+};
+
+const column_count = 6;
+const max_label_width = 40;
+
+fn writeReportEntries(gpa: std.mem.Allocator, writer: *std.Io.Writer, entries: []const LabeledSlot) !void {
+    try writer.print("[snitch] zones={d}\n\n", .{entries.len});
+
+    if (entries.len == 0) {
+        try writer.writeAll("(no measurements)\n");
+        return;
+    }
+
+    if (!timing_enabled and !memory_enabled) {
+        try writer.writeAll("snitch is enabled, but both snitch-timing and snitch-memory are disabled.\n");
+        return;
+    }
+
+    const rows = try gpa.alloc(Row, entries.len);
+    defer gpa.free(rows);
+
+    var first = true;
+    inline for (sections) |section| {
+        if (section.enabled) {
+            if (!first) {
+                try writer.writeByte('\n');
+            }
+            first = false;
+
+            var section_total: u128 = 0;
+            for (entries, rows) |entry, *row| {
+                const histogram = &@field(entry.slot, section.field);
+                const calls = histogram.count();
+                const total = @atomicLoad(u64, &histogram.total, .monotonic);
+                row.* = .{
+                    .label = entry.label,
+                    .calls = calls,
+                    .avg = if (calls == 0) 0 else total / calls,
+                    .percentile = if (calls == 0) 0 else histogram.percentile(calls, percentile_target),
+                    .total = total,
+                };
+                section_total += total;
+            }
+
+            std.sort.pdq(Row, rows, {}, Row.moreTotalFirst);
+            try writeTable(writer, section, rows, section_total);
+        }
+    }
 }
 
-/// Measure a call using the callsite file and line as the label.
+fn writeTable(writer: *std.Io.Writer, comptime section: Section, rows: []const Row, section_total: u128) !void {
+    const header = [column_count][]const u8{
+        "Metric",
+        "Calls",
+        "Avg " ++ section.unit,
+        std.fmt.comptimePrint("P{d} {s}", .{ percentile_target, section.unit }),
+        "Total " ++ section.unit,
+        "% Total",
+    };
+    const visible = if (report_max_rows == 0) rows else rows[0..@min(rows.len, report_max_rows)];
+
+    var widths: [column_count]usize = undefined;
+    for (&widths, header) |*width, cell| {
+        width.* = cell.len;
+    }
+    widths[5] = "100.00%".len;
+    for (visible) |row| {
+        widths[0] = @max(widths[0], @min(max_label_width, row.label.len));
+        widths[1] = @max(widths[1], std.fmt.count("{d}", .{row.calls}));
+        widths[2] = @max(widths[2], std.fmt.count("{d}", .{row.avg}));
+        widths[3] = @max(widths[3], std.fmt.count("{d}", .{row.percentile}));
+        widths[4] = @max(widths[4], std.fmt.count("{d}", .{row.total}));
+    }
+
+    try writer.print("{s}\n", .{section.title});
+    try writeSeparator(writer, widths);
+    try writeRow(writer, widths, header);
+    try writeSeparator(writer, widths);
+
+    for (visible) |row| {
+        var label_buffer: [max_label_width]u8 = undefined;
+        var buffers: [column_count][32]u8 = undefined;
+        try writeRow(writer, widths, .{
+            truncateLabel(row.label, &label_buffer),
+            try std.fmt.bufPrint(&buffers[1], "{d}", .{row.calls}),
+            try std.fmt.bufPrint(&buffers[2], "{d}", .{row.avg}),
+            try std.fmt.bufPrint(&buffers[3], "{d}", .{row.percentile}),
+            try std.fmt.bufPrint(&buffers[4], "{d}", .{row.total}),
+            try formatPercent(row.total, section_total, &buffers[5]),
+        });
+    }
+    try writeSeparator(writer, widths);
+
+    if (visible.len < rows.len) {
+        try writer.print(
+            "(showing {d} of {d} rows; build with -Dsnitch-max-rows=0 to show all)\n",
+            .{ visible.len, rows.len },
+        );
+    }
+}
+
+fn writeSeparator(writer: *std.Io.Writer, widths: [column_count]usize) !void {
+    for (widths) |width| {
+        try writer.writeByte('+');
+        try writer.splatByteAll('-', width + 2);
+    }
+    try writer.writeAll("+\n");
+}
+
+/// The label column is left-aligned; the numeric columns are right-aligned.
+fn writeRow(writer: *std.Io.Writer, widths: [column_count]usize, cells: [column_count][]const u8) !void {
+    for (cells, widths, 0..) |cell, width, column| {
+        if (column == 0) {
+            try writer.print("| {s:<[1]} ", .{ cell, width });
+        } else {
+            try writer.print("| {s:>[1]} ", .{ cell, width });
+        }
+    }
+    try writer.writeAll("|\n");
+}
+
+fn truncateLabel(label: []const u8, buffer: *[max_label_width]u8) []const u8 {
+    if (label.len <= max_label_width) {
+        return label;
+    }
+
+    const kept = max_label_width - "...".len;
+    @memcpy(buffer[0..kept], label[0..kept]);
+    @memcpy(buffer[kept..], "...");
+    return buffer;
+}
+
+fn formatPercent(part: u64, whole: u128, buffer: []u8) ![]const u8 {
+    if (whole == 0) {
+        return "0.00%";
+    }
+
+    const ratio = @as(f64, @floatFromInt(part)) / @as(f64, @floatFromInt(whole));
+    return std.fmt.bufPrint(buffer, "{d:.2}%", .{ratio * 100.0});
+}
+
+fn comptimeSourceLabel(comptime source_location: std.builtin.SourceLocation) []const u8 {
+    return std.fmt.comptimePrint("{s}:{d}", .{ source_location.file, source_location.line });
+}
+
+// ---------------------------------------------------------------------------
+// Process-wide profiler
+
+var default_profiler: Profiler = undefined;
+var default_started: std.atomic.Value(bool) = .init(false);
+
+/// Start the process-wide profiler. Call it once, before any zones you want
+/// recorded; zones started earlier are ignored. `base_allocator` must be
+/// thread-safe if zones end on several threads.
+pub fn start(io: std.Io, base_allocator: std.mem.Allocator) callconv(callingConvention()) void {
+    std.debug.assert(!default_started.load(.monotonic));
+    default_profiler = .init(io, base_allocator);
+    default_started.store(true, .release);
+}
+
+/// Print the process-wide profiler's report to stderr, then free it. Call it
+/// after every zone has ended, typically with `defer` right after `start`.
+pub fn finish() callconv(callingConvention()) void {
+    if (!default_started.load(.acquire)) {
+        return;
+    }
+
+    default_profiler.printReport() catch {};
+    stop();
+}
+
+/// Free the process-wide profiler without printing a report.
+pub fn stop() callconv(callingConvention()) void {
+    if (!default_started.swap(false, .acq_rel)) {
+        return;
+    }
+
+    default_profiler.deinit();
+}
+
+/// The process-wide profiler, or null before `start` and after `finish`.
+pub fn defaultProfiler() callconv(callingConvention()) ?*Profiler {
+    return if (default_started.load(.acquire)) &default_profiler else null;
+}
+
+/// Allocator whose allocations count towards the process-wide profiler's
+/// memory metrics. Panics if called before `start`.
+pub fn allocator() callconv(callingConvention()) std.mem.Allocator {
+    const profiler = defaultProfiler() orelse @panic("snitch.allocator() called before snitch.start()");
+    return profiler.allocator();
+}
+
+/// Start a zone on the process-wide profiler. Call `end` on the result.
+pub fn zone(comptime label: []const u8) callconv(callingConvention()) Zone {
+    if (comptime !enabled) {
+        return .{};
+    }
+
+    const profiler = defaultProfiler() orelse return .inactive;
+    return profiler.zone(label);
+}
+
+/// Like `zone`, labeled with the caller's file and line.
+pub fn zoneHere(comptime source_location: std.builtin.SourceLocation) callconv(callingConvention()) Zone {
+    return zone(comptimeSourceLabel(source_location));
+}
+
+/// Call `function` with `args`, measure it on the process-wide profiler, and
+/// return its result.
+pub fn measureCall(
+    comptime label: []const u8,
+    function: anytype,
+    args: anytype,
+) callconv(callingConvention()) @TypeOf(@call(.auto, function, args)) {
+    var measurement = zone(label);
+    defer measurement.end();
+    return @call(.auto, function, args);
+}
+
+/// Like `measureCall`, labeled with the caller's file and line.
 pub fn measureCallHere(
-    profiler: *Profiler,
     function: anytype,
     args: anytype,
     comptime source_location: std.builtin.SourceLocation,
 ) callconv(callingConvention()) @TypeOf(@call(.auto, function, args)) {
-    return measureCall(profiler, comptimeSourceLabel(source_location), function, args);
+    return measureCall(comptimeSourceLabel(source_location), function, args);
 }
 
-/// Measure a block using the callsite file and line as the label.
+/// Run `block`, measure it on the process-wide profiler, and return its result.
+pub fn measureBlock(
+    comptime label: []const u8,
+    block: anytype,
+) callconv(callingConvention()) @TypeOf(block()) {
+    var measurement = zone(label);
+    defer measurement.end();
+    return block();
+}
+
+/// Like `measureBlock`, labeled with the caller's file and line.
 pub fn measureBlockHere(
-    profiler: *Profiler,
     block: anytype,
     comptime source_location: std.builtin.SourceLocation,
 ) callconv(callingConvention()) @TypeOf(block()) {
-    return measureBlock(profiler, comptimeSourceLabel(source_location), block);
+    return measureBlock(comptimeSourceLabel(source_location), block);
 }
 
-/// Convenience helper for writing the report directly to stdout.
-pub fn writeReportStdout(
-    profiler: *Profiler,
-    comptime buffer_size: usize,
-) callconv(callingConvention()) !void {
-    if (comptime !enabled) {
-        return;
+test "histogram buckets cover u64 and bound the error at 1/64" {
+
+    var value: u64 = 0;
+    while (value < 4_096) : (value += 1) {
+        const upper = Histogram.bucketUpperBound(Histogram.bucketIndex(value));
+        try std.testing.expect(upper >= value);
+        try std.testing.expect(upper - value <= value / 64);
     }
 
-    if (comptime buffer_size == 0) {
-        @compileError("buffer_size must be greater than zero");
+    var shift: u6 = 12;
+    while (shift < 63) : (shift += 1) {
+        for ([_]u64{ @as(u64, 1) << shift, (@as(u64, 1) << shift) + 12_345, (@as(u64, 1) << (shift + 1)) - 1 }) |sample| {
+            const upper = Histogram.bucketUpperBound(Histogram.bucketIndex(sample));
+            try std.testing.expect(upper >= sample);
+            try std.testing.expect(upper - sample <= sample / 64);
+        }
     }
 
-    var stdout_buffer: [buffer_size]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    try profiler.writeReport(&stdout_writer.interface);
-    try stdout_writer.end();
+    try std.testing.expectEqual(Histogram.bucket_count - 1, Histogram.bucketIndex(std.math.maxInt(u64)));
+    try std.testing.expectEqual(std.math.maxInt(u64), Histogram.bucketUpperBound(Histogram.bucket_count - 1));
 }
 
-fn comptimeSourceLabel(comptime source_location: std.builtin.SourceLocation) []const u8 {
-    return std.fmt.comptimePrint(
-        "{s}:{d}",
-        .{ source_location.file, source_location.line },
-    );
+test "histogram percentile uses nearest rank" {
+    const histogram = try std.testing.allocator.create(Histogram);
+    defer std.testing.allocator.destroy(histogram);
+    histogram.* = .{};
+
+    for (1..101) |value| {
+        histogram.observe(value);
+    }
+
+    try std.testing.expectEqual(@as(u64, 100), histogram.count());
+    try std.testing.expectEqual(@as(u64, 5_050), histogram.total);
+    try std.testing.expectEqual(@as(u64, 1), histogram.percentile(100, 1));
+    try std.testing.expectEqual(@as(u64, 95), histogram.percentile(100, 95));
+    try std.testing.expectEqual(@as(u64, 100), histogram.percentile(100, 100));
+
+    histogram.observe(1_000_000);
+    const p100 = histogram.percentile(101, 100);
+    try std.testing.expectEqual(@as(u64, 1_000_000), p100);
+}
+
+fn labelSlot(profiler: *Profiler, comptime label: []const u8) *const Slot {
+    return profiler.slots[labelIndex(label)].?;
+}
+
+test "a label used at several call sites shares one slot" {
+    if (!timing_enabled and !memory_enabled) return;
+
+    var profiler = Profiler.init(std.testing.io, std.testing.allocator);
+    defer profiler.deinit();
+
+    var first = profiler.zone("shared-label");
+    first.end();
+    var second = profiler.zone("shared-" ++ "label");
+    second.end();
+    var other = profiler.zone("other-label");
+    other.end();
+
+    try std.testing.expectEqual(@as(u64, 2), labelSlot(&profiler, "shared-label").calls());
+    try std.testing.expectEqual(@as(u64, 1), labelSlot(&profiler, "other-label").calls());
+}
+
+test "zones only count allocations made on their own thread" {
+    if (!memory_enabled) return;
+
+    var profiler = Profiler.init(std.testing.io, std.testing.allocator);
+    defer profiler.deinit();
+    const tracked = profiler.allocator();
+
+    var measurement = profiler.zone("thread-local-allocs");
+
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(parent: std.mem.Allocator) !void {
+            const noise = try parent.alloc(u8, 4_096);
+            parent.free(noise);
+        }
+    }.run, .{tracked});
+    thread.join();
+
+    const own = try tracked.alloc(u8, 10);
+    tracked.free(own);
+    measurement.end();
+
+    const slot = labelSlot(&profiler, "thread-local-allocs");
+    try std.testing.expectEqual(@as(u64, 10), slot.alloc_bytes.total);
+    try std.testing.expectEqual(@as(u64, 1), slot.alloc_calls.total);
+}
+
+test "concurrent zones are all recorded" {
+    if (!timing_enabled and !memory_enabled) return;
+
+    var profiler = Profiler.init(std.testing.io, std.heap.smp_allocator);
+    defer profiler.deinit();
+
+    const thread_count = 8;
+    const zones_per_thread = 10_000;
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, struct {
+            fn run(p: *Profiler) void {
+                for (0..zones_per_thread) |_| {
+                    var measurement = p.zone("concurrent");
+                    measurement.end();
+                }
+            }
+        }.run, .{&profiler});
+    }
+    for (threads) |thread| {
+        thread.join();
+    }
+
+    const slot = labelSlot(&profiler, "concurrent");
+    try std.testing.expectEqual(@as(u64, thread_count * zones_per_thread), slot.calls());
 }
