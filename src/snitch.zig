@@ -62,7 +62,8 @@ pub const memory_enabled = enabled and build_options.snitch_memory;
 
 /// How a report is laid out.
 pub const ReportOptions = struct {
-    /// Rows per table, sorted by total; `0` shows every zone.
+    /// Rows per table in parent-first order, siblings sorted by inclusive
+    /// total; `0` shows every path. Truncation always retains ancestors.
     max_rows: usize = 0,
 };
 
@@ -79,6 +80,14 @@ const max_labels = 1024;
 // its thread through a different profiler's allocator.
 threadlocal var thread_alloc_bytes: u64 = 0;
 threadlocal var thread_alloc_calls: u64 = 0;
+
+// Values rather than pointers to returned Zones: callers may move a Zone.
+// Scan backwards for the same profiler so interleaved profilers stay independent.
+const ActiveZone = struct { profiler: ?*Profiler, slot: *Slot };
+threadlocal var active_zones: std.ArrayList(ActiveZone) = .empty;
+// Usual nesting needs no stack allocations. Deeper stacks spill dynamically
+// and release their storage when the last active zone ends (also on threads).
+threadlocal var inline_zones: [16]ActiveZone = undefined;
 
 const TrackingAllocator = struct {
     parent: std.mem.Allocator,
@@ -295,8 +304,12 @@ const Histogram = struct {
 const TimingHistogram = if (timing_enabled) Histogram else void;
 const MemoryHistogram = if (memory_enabled) Histogram else void;
 
-/// Metrics for one label.
+/// Metrics for one label under one complete parent path.
 const Slot = struct {
+    label_index: u32,
+    parent: ?*Slot,
+    children: ?*Slot = null,
+    next: ?*Slot = null,
     timing: TimingHistogram = if (timing_enabled) .{} else {},
     alloc_bytes: MemoryHistogram = if (memory_enabled) .{} else {},
     alloc_calls: MemoryHistogram = if (memory_enabled) .{} else {},
@@ -314,7 +327,7 @@ fn callingConvention() std.builtin.CallingConvention {
     return if (!enabled) .@"inline" else .auto;
 }
 
-/// Collects metrics per zone label. Most programs can use the process-wide
+/// Collects metrics per zone path. Most programs can use the process-wide
 /// profiler through `start`, `zone` and `finish` instead of creating one.
 ///
 /// When snitch is disabled, every method is an inlined no-op.
@@ -347,12 +360,21 @@ pub const Profiler = struct {
         if (enabled) {
             for (self.slots) |maybe_slot| {
                 if (maybe_slot) |slot| {
-                    self.base_allocator.destroy(slot);
+                    self.destroySlot(slot);
                 }
             }
         }
 
         self.* = undefined;
+    }
+
+    fn destroySlot(self: *Profiler, slot: *Slot) void {
+        var child = slot.children;
+        while (child) |item| {
+            child = item.next;
+            self.destroySlot(item);
+        }
+        self.base_allocator.destroy(slot);
     }
 
     /// Allocator whose allocations count towards memory metrics. Use it in the
@@ -366,7 +388,8 @@ pub const Profiler = struct {
     }
 
     /// Start a zone named by `name`: a string, or `@src()` to use the caller's
-    /// function, file and line. Call `end` on the result to record it.
+    /// function, file and line. End zones once, in reverse start order on
+    /// their starting thread. Nesting is independent for each profiler.
     pub fn zone(self: *Profiler, comptime name: anytype) callconv(callingConvention()) Zone {
         if (comptime !enabled) {
             return .{};
@@ -376,9 +399,34 @@ pub const Profiler = struct {
             _ = self.open_zones.fetchAdd(1, .monotonic);
         }
 
+        var parent: ?*Slot = null;
+        var index = active_zones.items.len;
+        while (index > 0) {
+            index -= 1;
+            if (active_zones.items[index].profiler == self) {
+                parent = active_zones.items[index].slot;
+                break;
+            }
+        }
+        const slot = self.slotFor(labelIndex(zoneLabel(name)), parent);
+        const stack_index = active_zones.items.len;
+        if (active_zones.capacity == 0) {
+            active_zones = .initBuffer(&inline_zones);
+        } else if (active_zones.items.len == inline_zones.len and active_zones.items.ptr == &inline_zones) {
+            var spilled: std.ArrayList(ActiveZone) = .empty;
+            spilled.ensureTotalCapacity(std.heap.smp_allocator, inline_zones.len * 2) catch |err| @panic(@errorName(err));
+            spilled.appendSliceAssumeCapacity(active_zones.items);
+            active_zones = spilled;
+        }
+        if (active_zones.items.len == active_zones.capacity) {
+            active_zones.ensureTotalCapacity(std.heap.smp_allocator, active_zones.items.len + 1) catch |err| @panic(@errorName(err));
+        }
+        active_zones.appendAssumeCapacity(.{ .profiler = self, .slot = slot });
+
         return .{
             .profiler = self,
-            .label_index = labelIndex(zoneLabel(name)),
+            .slot = slot,
+            .stack_index = stack_index,
             .start_alloc_bytes = thread_alloc_bytes,
             .start_alloc_calls = thread_alloc_calls,
             .start = if (timing_enabled) .now(self.io, .awake) else {},
@@ -410,24 +458,31 @@ pub const Profiler = struct {
         try stderr_writer.interface.flush();
     }
 
-    /// Write the report as ASCII tables.
+    /// Write tables with ordinary Unicode tree connectors. Finish all zones
+    /// before reporting to obtain complete inclusive totals.
     pub fn writeReport(self: *Profiler, writer: *std.Io.Writer, options: ReportOptions) callconv(callingConvention()) !void {
         if (comptime !enabled) {
             return;
         }
 
         const labels = registry.labels();
-        const entries = try self.base_allocator.alloc(LabeledSlot, labels.len);
-        defer self.base_allocator.free(entries);
-
-        var entry_count: usize = 0;
-        for (labels, 0..) |label, index| {
+        var entries: std.ArrayList(LabeledSlot) = .empty;
+        defer entries.deinit(self.base_allocator);
+        for (labels, 0..) |_, index| {
             const slot = @atomicLoad(?*Slot, &self.slots[index], .acquire) orelse continue;
-            entries[entry_count] = .{ .label = label, .slot = slot };
-            entry_count += 1;
+            try self.collectEntries(slot, labels, &entries);
         }
 
-        try writeReportEntries(self.base_allocator, writer, entries[0..entry_count], options);
+        try writeReportEntries(self.base_allocator, writer, entries.items, options);
+    }
+
+    fn collectEntries(self: *Profiler, slot: *Slot, labels: []const []const u8, entries: *std.ArrayList(LabeledSlot)) !void {
+        try entries.append(self.base_allocator, .{ .label = labels[slot.label_index], .slot = slot });
+        var child = @atomicLoad(?*Slot, &slot.children, .acquire);
+        while (child) |item| {
+            try self.collectEntries(item, labels, entries);
+            child = item.next;
+        }
     }
 
     fn assertNoOpenZones(self: *Profiler) void {
@@ -444,30 +499,27 @@ pub const Profiler = struct {
         }
     }
 
-    /// Slot for a label index, created on first use. Racing threads may
-    /// both allocate one; the loser frees its copy.
-    fn slotFor(self: *Profiler, index: u32) *Slot {
-        const target = &self.slots[index];
-        if (@atomicLoad(?*Slot, target, .acquire)) |existing| {
-            return existing;
+    /// Publish each path once. Child links are immutable after publication;
+    /// competing threads retry against the winner rather than duplicating it.
+    fn slotFor(self: *Profiler, index: u32, parent: ?*Slot) *Slot {
+        const target = if (parent) |p| &p.children else &self.slots[index];
+        var head = @atomicLoad(?*Slot, target, .acquire);
+        while (true) {
+            var item = head;
+            while (item) |existing| {
+                if (existing.label_index == index) return existing;
+                item = existing.next;
+            }
+            const created = self.base_allocator.create(Slot) catch |err| @panic(@errorName(err));
+            created.* = .{ .label_index = index, .parent = parent, .next = head };
+            if (@cmpxchgStrong(?*Slot, target, head, created, .acq_rel, .acquire)) |winner| {
+                self.base_allocator.destroy(created);
+                head = winner;
+            } else return created;
         }
-
-        const created = self.base_allocator.create(Slot) catch |err| {
-            @panic(@errorName(err));
-        };
-        created.* = .{};
-
-        if (@cmpxchgStrong(?*Slot, target, null, created, .acq_rel, .acquire)) |winner| {
-            self.base_allocator.destroy(created);
-            return winner.?;
-        }
-
-        return created;
     }
 
-    fn record(self: *Profiler, label_index: u32, elapsed_ns: u64, alloc_bytes: u64, alloc_calls: u64) void {
-        const target = self.slotFor(label_index);
-
+    fn record(_: *Profiler, target: *Slot, elapsed_ns: u64, alloc_bytes: u64, alloc_calls: u64) void {
         if (timing_enabled) {
             target.timing.observe(elapsed_ns);
         }
@@ -480,18 +532,20 @@ pub const Profiler = struct {
 };
 
 /// A measurement in progress. Call `end` once, on the thread that started
-/// it; calling it twice records the zone twice.
+/// it, in reverse start order. Do not call `end` twice.
 pub const Zone = if (enabled) struct {
     /// Null for zones started before `snitch.start`; ending them does nothing.
     profiler: ?*Profiler,
-    label_index: u32,
+    slot: *Slot,
+    stack_index: usize,
     start_alloc_bytes: u64,
     start_alloc_calls: u64,
     start: if (timing_enabled) std.Io.Timestamp else void,
 
     const inactive: Zone = .{
         .profiler = null,
-        .label_index = 0,
+        .slot = undefined,
+        .stack_index = 0,
         .start_alloc_bytes = 0,
         .start_alloc_calls = 0,
         .start = undefined,
@@ -500,6 +554,22 @@ pub const Zone = if (enabled) struct {
     /// Stop measuring and record the sample.
     pub fn end(self: Zone) void {
         const profiler = self.profiler orelse return;
+        // Other profilers may be interleaved, but each profiler must unwind
+        // its own stack in order. Remove this frame without disturbing them.
+        std.debug.assert(self.stack_index < active_zones.items.len);
+        std.debug.assert(active_zones.items[self.stack_index].slot == self.slot);
+        for (active_zones.items[self.stack_index + 1 ..]) |frame| {
+            std.debug.assert(frame.profiler != profiler);
+        }
+        // Leave a tombstone so outstanding Zones keep stable stack indices.
+        active_zones.items[self.stack_index].profiler = null;
+        while (active_zones.items.len > 0 and active_zones.items[active_zones.items.len - 1].profiler == null) {
+            _ = active_zones.pop();
+        }
+        if (active_zones.items.len == 0) {
+            if (active_zones.items.ptr != &inline_zones) active_zones.deinit(std.heap.smp_allocator);
+            active_zones = .empty;
+        }
         if (track_open_zones) {
             _ = profiler.open_zones.fetchSub(1, .release);
         }
@@ -512,7 +582,7 @@ pub const Zone = if (enabled) struct {
         } else 0;
 
         profiler.record(
-            self.label_index,
+            self.slot,
             elapsed_ns,
             thread_alloc_bytes -% self.start_alloc_bytes,
             thread_alloc_calls -% self.start_alloc_calls,
@@ -534,6 +604,9 @@ const Unit = enum { time, bytes };
 
 const Row = struct {
     label: []const u8,
+    slot: *const Slot = undefined,
+    prefix: [cell_capacity]u8 = undefined,
+    prefix_len: usize = 0,
     calls: u64,
     avg: u64,
     p50: u64,
@@ -573,7 +646,8 @@ const Row = struct {
 };
 
 const max_label_width = 40;
-const cell_capacity = max_label_width;
+// UTF-8 may need four bytes per terminal column.
+const cell_capacity = max_label_width * 4;
 const timing_columns = [_][]const u8{ "Zone", "Calls", "Avg", "P50", "P95", "P99", "Max", "Total", "% Total" };
 const memory_columns = [_][]const u8{ "Zone", "Calls", "Avg", "P50", "P95", "P99", "Max", "Total", "Allocs/call", "% Total" };
 
@@ -607,9 +681,10 @@ fn writeZoneSections(
     if (timing_enabled) {
         for (entries, rows) |entry, *row| {
             row.* = .fromHistogram(entry.label, &entry.slot.timing);
+            row.slot = entry.slot;
         }
-        try writer.writeAll("\nTiming per call\n");
-        try writeTable(writer, .time, &timing_columns, rows, options);
+        try writer.writeAll("\nTiming per call (inclusive; % Total of root totals)\n");
+        try writeTable(gpa, writer, .time, &timing_columns, rows, options);
     }
 
     if (memory_enabled) {
@@ -620,20 +695,22 @@ fn writeZoneSections(
             if (row.total == 0) continue;
             const allocs = @atomicLoad(u64, &entry.slot.alloc_calls.total, .monotonic);
             rows[allocating] = row;
+            rows[allocating].slot = entry.slot;
             rows[allocating].allocs_per_call = @as(f64, @floatFromInt(allocs)) / @as(f64, @floatFromInt(row.calls));
             allocating += 1;
         }
 
-        try writer.writeAll("\nMemory allocated per call\n");
+        try writer.writeAll("\nMemory allocated per call (inclusive; % Total of root totals)\n");
         if (allocating == 0) {
             try writer.writeAll("(no zone allocated through the tracked allocator)\n");
         } else {
-            try writeTable(writer, .bytes, &memory_columns, rows[0..allocating], options);
+            try writeTable(gpa, writer, .bytes, &memory_columns, rows[0..allocating], options);
         }
     }
 }
 
 fn writeTable(
+    gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
     comptime unit: Unit,
     comptime header: []const []const u8,
@@ -645,11 +722,16 @@ fn writeTable(
     const Buffers = [column_count][cell_capacity]u8;
 
     std.sort.pdq(Row, rows, {}, Row.moreTotalFirst);
-    const visible = if (options.max_rows == 0) rows else rows[0..@min(rows.len, options.max_rows)];
+    const ordered = try gpa.alloc(Row, rows.len);
+    defer gpa.free(ordered);
+    var count: usize = 0;
+    orderChildren(rows, null, "", ordered, &count);
+    std.debug.assert(count == rows.len);
+    const visible = ordered[0..if (options.max_rows == 0) ordered.len else @min(ordered.len, options.max_rows)];
 
     var grand_total: u128 = 0;
     for (rows) |row| {
-        grand_total += row.total;
+        if (row.slot.parent == null) grand_total += row.total;
     }
 
     var widths: [column_count]usize = undefined;
@@ -659,7 +741,7 @@ fn writeTable(
     for (visible) |row| {
         var buffers: Buffers = undefined;
         for (&widths, try rowCells(unit, column_count, row, grand_total, &buffers)) |*width, cell| {
-            width.* = @max(width.*, cell.len);
+            width.* = @max(width.*, displayWidth(cell));
         }
     }
 
@@ -675,9 +757,42 @@ fn writeTable(
 
     if (visible.len < rows.len) {
         try writer.print(
-            "(showing the top {d} of {d} zones)\n",
+            "(showing the first {d} of {d} zones in tree order)\n",
             .{ visible.len, rows.len },
         );
+    }
+}
+
+// The global total sort supplies sibling order, not output order. Walk each
+// parent's children before advancing to its next sibling.
+fn orderChildren(rows: []const Row, parent: ?*const Slot, prefix: []const u8, ordered: []Row, count: *usize) void {
+    var remaining: usize = 0;
+    for (rows) |row| {
+        if (row.slot.parent == parent) remaining += 1;
+    }
+    for (rows) |row| {
+        if (row.slot.parent != parent) continue;
+        remaining -= 1;
+        var item = row;
+        var child_prefix: [cell_capacity]u8 = undefined;
+        var child_len: usize = 0;
+        if (parent != null) {
+            const connector = if (remaining == 0) "└─ " else "├─ ";
+            const continuation = if (remaining == 0) "   " else "│  ";
+            // Very deep paths still traverse fully; only their printed prefix
+            // is bounded by the report's label column.
+            var kept = @min(prefix.len, cell_capacity - 8);
+            while (kept < prefix.len and prefix[kept] & 0xc0 == 0x80) kept -= 1;
+            @memcpy(item.prefix[0..kept], prefix[0..kept]);
+            @memcpy(item.prefix[kept..][0..connector.len], connector);
+            item.prefix_len = kept + connector.len;
+            @memcpy(child_prefix[0..kept], prefix[0..kept]);
+            @memcpy(child_prefix[kept..][0..continuation.len], continuation);
+            child_len = kept + continuation.len;
+        }
+        ordered[count.*] = item;
+        count.* += 1;
+        orderChildren(rows, row.slot, child_prefix[0..child_len], ordered, count);
     }
 }
 
@@ -694,7 +809,7 @@ fn rowCells(
     };
 
     var cells: [column_count][]const u8 = undefined;
-    cells[0] = truncateLabel(row.label, buffers[0][0..max_label_width]);
+    cells[0] = truncateParts(row.prefix[0..row.prefix_len], row.label, &buffers[0]);
     cells[1] = try formatCount(row.calls, &buffers[1]);
     cells[2] = try format(row.avg, &buffers[2]);
     cells[3] = try format(row.p50, &buffers[3]);
@@ -721,24 +836,77 @@ fn writeSeparator(writer: *std.Io.Writer, widths: []const usize) !void {
 /// right-aligned numbers.
 fn writeRowCells(writer: *std.Io.Writer, widths: []const usize, text_columns: usize, cells: []const []const u8) !void {
     for (cells, widths, 0..) |cell, width, column| {
+        const padding = width - displayWidth(cell);
+        try writer.writeAll("| ");
         if (column < text_columns) {
-            try writer.print("| {s:<[1]} ", .{ cell, width });
+            try writer.writeAll(cell);
+            try writer.splatByteAll(' ', padding);
         } else {
-            try writer.print("| {s:>[1]} ", .{ cell, width });
+            try writer.splatByteAll(' ', padding);
+            try writer.writeAll(cell);
         }
+        try writer.writeByte(' ');
     }
     try writer.writeAll("|\n");
 }
 
-fn truncateLabel(label: []const u8, buffer: *[max_label_width]u8) []const u8 {
-    if (label.len <= max_label_width) {
-        return label;
-    }
+fn truncateLabel(label: []const u8, buffer: []u8) []const u8 {
+    return truncateParts("", label, buffer);
+}
 
-    const kept = max_label_width - "...".len;
-    @memcpy(buffer[0..kept], label[0..kept]);
-    @memcpy(buffer[kept..], "...");
-    return buffer;
+fn truncateParts(prefix: []const u8, label: []const u8, buffer: []u8) []const u8 {
+    const truncated = displayWidth(prefix) + displayWidth(label) > max_label_width or prefix.len + label.len > buffer.len;
+    const limit: usize = if (truncated) max_label_width - 3 else max_label_width;
+    var len: usize = 0;
+    var width: usize = 0;
+    outer: for ([_][]const u8{ prefix, label }) |part| {
+        var iterator = std.unicode.Utf8View.initUnchecked(part).iterator();
+        while (iterator.nextCodepointSlice()) |bytes| {
+            const cp = std.unicode.utf8Decode(bytes) catch unreachable;
+            const columns = codepointWidth(cp);
+            if (width + columns > limit or len + bytes.len > buffer.len - @as(usize, if (truncated) 3 else 0)) break :outer;
+            @memcpy(buffer[len..][0..bytes.len], bytes);
+            len += bytes.len;
+            width += columns;
+        }
+    }
+    if (truncated) {
+        @memcpy(buffer[len..][0..3], "...");
+        len += 3;
+    }
+    return buffer[0..len];
+}
+
+fn displayWidth(text: []const u8) usize {
+    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
+    var width: usize = 0;
+    while (iterator.nextCodepoint()) |cp| width += codepointWidth(cp);
+    return width;
+}
+
+// Terminal widths for ordinary text, combining marks and wide CJK/emoji.
+// Grapheme sequences (such as joined emoji) may vary with the terminal/font.
+fn codepointWidth(cp: u21) usize {
+    if (cp < 0x20 or (cp >= 0x7f and cp < 0xa0) or
+        (cp >= 0x0300 and cp <= 0x036f) or
+        (cp >= 0x1ab0 and cp <= 0x1aff) or
+        (cp >= 0x1dc0 and cp <= 0x1dff) or
+        (cp >= 0x200b and cp <= 0x200f) or
+        (cp >= 0x20d0 and cp <= 0x20ff) or
+        (cp >= 0xfe00 and cp <= 0xfe0f) or
+        (cp >= 0xfe20 and cp <= 0xfe2f) or
+        (cp >= 0xe0100 and cp <= 0xe01ef)) return 0;
+    if ((cp >= 0x1100 and cp <= 0x115f) or cp == 0x2329 or cp == 0x232a or
+        (cp >= 0x2e80 and cp <= 0xa4cf and cp != 0x303f) or
+        (cp >= 0xac00 and cp <= 0xd7a3) or
+        (cp >= 0xf900 and cp <= 0xfaff) or
+        (cp >= 0xfe10 and cp <= 0xfe19) or
+        (cp >= 0xfe30 and cp <= 0xfe6f) or
+        (cp >= 0xff00 and cp <= 0xff60) or
+        (cp >= 0xffe0 and cp <= 0xffe6) or
+        (cp >= 0x1f300 and cp <= 0x1faff) or
+        (cp >= 0x20000 and cp <= 0x3fffd)) return 2;
+    return 1;
 }
 
 /// Scale `value` to the largest unit it reaches and print three significant
@@ -991,7 +1159,7 @@ fn describeLayouts(comptime types: anytype) [types.len]TypeLayout {
 
 fn layoutCells(item: *const TypeLayout, buffers: *[layout_columns.len][cell_capacity]u8) ![layout_columns.len][]const u8 {
     return .{
-        truncateLabel(item.name, buffers[0][0..max_label_width]),
+        truncateLabel(item.name, &buffers[0]),
         item.kind,
         try formatBytes(item.size, &buffers[2]),
         try std.fmt.bufPrint(&buffers[3], "{d}", .{item.alignment}),
@@ -1002,8 +1170,8 @@ fn layoutCells(item: *const TypeLayout, buffers: *[layout_columns.len][cell_capa
 
 fn fieldCells(field: FieldLayout, buffers: *[field_columns.len][cell_capacity]u8) ![field_columns.len][]const u8 {
     return .{
-        truncateLabel(field.name, buffers[0][0..max_label_width]),
-        truncateLabel(field.type_name, buffers[1][0..max_label_width]),
+        truncateLabel(field.name, &buffers[0]),
+        truncateLabel(field.type_name, &buffers[1]),
         try std.fmt.bufPrint(&buffers[2], "{d}", .{field.offset}),
         try formatBytes(field.size, &buffers[3]),
         try std.fmt.bufPrint(&buffers[4], "{d}", .{field.alignment}),
@@ -1031,7 +1199,7 @@ fn StringTable(comptime column_count: usize) type {
 
         fn measure(self: *Self, cells: [column_count][]const u8) !void {
             for (&self.widths, cells) |*width, cell| {
-                width.* = @max(width.*, cell.len);
+                width.* = @max(width.*, displayWidth(cell));
             }
         }
 
@@ -1473,6 +1641,204 @@ test "histogram percentile uses nearest rank" {
 
 fn labelSlot(profiler: *Profiler, comptime label: []const u8) *const Slot {
     return profiler.slots[labelIndex(label)].?;
+}
+
+test "paths distinguish parents and repeated ancestors and restore the stack" {
+    if (!enabled) return;
+    var profiler = Profiler.init(std.testing.io, std.testing.allocator);
+    defer profiler.deinit();
+
+    var leaf: *Slot = undefined;
+    var recursive_leaf: *Slot = undefined;
+    for (0..2) |_| {
+        const root = profiler.zone("path-a");
+        const child = profiler.zone("path-leaf");
+        leaf = child.slot;
+        child.end();
+        const recursive = profiler.zone("path-a");
+        const deep = profiler.zone("path-leaf");
+        recursive_leaf = deep.slot;
+        deep.end();
+        recursive.end();
+        const restored = profiler.zone("path-leaf");
+        try std.testing.expectEqual(leaf, restored.slot);
+        restored.end();
+        root.end();
+    }
+    const other = profiler.zone("path-b");
+    const other_leaf = profiler.zone("path-leaf");
+    try std.testing.expect(other_leaf.slot != leaf);
+    try std.testing.expect(recursive_leaf != leaf);
+    try std.testing.expectEqual(other.slot, other_leaf.slot.parent.?);
+    other_leaf.end();
+    other.end();
+    const root_leaf = profiler.zone("path-leaf");
+    try std.testing.expect(root_leaf.slot.parent == null);
+    try std.testing.expect(root_leaf.slot != leaf);
+    root_leaf.end();
+    if (timing_enabled or memory_enabled) {
+        try std.testing.expectEqual(@as(u64, 4), leaf.calls());
+        try std.testing.expectEqual(@as(u64, 2), recursive_leaf.calls());
+    }
+    try std.testing.expectEqual(@as(usize, 0), active_zones.items.len);
+}
+
+test "interleaved profilers have independent stacks even when one ends first" {
+    if (!enabled) return;
+    var a = Profiler.init(std.testing.io, std.testing.allocator);
+    defer a.deinit();
+    var b = Profiler.init(std.testing.io, std.testing.allocator);
+    defer b.deinit();
+    const a_root = a.zone("independent");
+    const b_root = b.zone("independent");
+    const a_child = a.zone("independent");
+    try std.testing.expect(b_root.slot.parent == null);
+    try std.testing.expect(a_root.slot != b_root.slot);
+    try std.testing.expectEqual(a_root.slot, a_child.slot.parent.?);
+    a_child.end();
+    a_root.end(); // leaves b's frame in place
+    a.deinit();
+    a = .init(std.testing.io, std.testing.allocator);
+    const new_root = a.zone("independent");
+    try std.testing.expect(new_root.slot.parent == null);
+    new_root.end();
+    const b_child = b.zone("independent-child");
+    try std.testing.expectEqual(b_root.slot, b_child.slot.parent.?);
+    b_child.end();
+    b_root.end();
+    try std.testing.expectEqual(@as(usize, 0), active_zones.items.len);
+}
+
+test "deep repeated paths grow the active stack and keep truncated reports valid UTF-8" {
+    if (!enabled) return;
+    var profiler = Profiler.init(std.testing.io, std.testing.allocator);
+    defer profiler.deinit();
+    var zones: [80]Zone = undefined;
+    for (&zones, 0..) |*measurement, index| {
+        measurement.* = profiler.zone("deep-é");
+        if (index > 0) try std.testing.expectEqual(zones[index - 1].slot, measurement.slot.parent.?);
+    }
+    const allocation = try profiler.allocator().alloc(u8, 1);
+    profiler.allocator().free(allocation);
+    var index = zones.len;
+    while (index > 0) {
+        index -= 1;
+        zones[index].end();
+    }
+    try std.testing.expectEqual(@as(usize, 0), active_zones.items.len);
+    try std.testing.expectEqual(@as(usize, 0), active_zones.capacity);
+    var storage: [65536]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try profiler.writeReport(&writer, .{});
+    try std.testing.expect(std.unicode.utf8ValidateSlice(writer.buffered()));
+    if (timing_enabled or memory_enabled) try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "...") != null);
+}
+
+test "nested allocation totals remain inclusive" {
+    if (!memory_enabled) return;
+    var profiler = Profiler.init(std.testing.io, std.testing.allocator);
+    defer profiler.deinit();
+    const tracked = profiler.allocator();
+    const root = profiler.zone("alloc-parent");
+    const own = try tracked.alloc(u8, 7);
+    tracked.free(own);
+    const child = profiler.zone("alloc-child");
+    const nested = try tracked.alloc(u8, 11);
+    tracked.free(nested);
+    child.end();
+    root.end();
+    try std.testing.expectEqual(@as(u64, 18), root.slot.alloc_bytes.total);
+    try std.testing.expectEqual(@as(u64, 11), child.slot.alloc_bytes.total);
+    try std.testing.expectEqual(@as(u64, 2), root.slot.alloc_calls.total);
+    try std.testing.expectEqual(@as(u64, 1), child.slot.alloc_calls.total);
+}
+
+test "report traverses sorted siblings and percentages use all roots before truncation" {
+    if (!timing_enabled and !memory_enabled) return;
+    var profiler = Profiler.init(std.testing.io, std.testing.allocator);
+    defer profiler.deinit();
+    const root = profiler.slotFor(labelIndex("report-root"), null);
+    const second = profiler.slotFor(labelIndex("report-second"), null);
+    const small = profiler.slotFor(labelIndex("small"), root);
+    const big = profiler.slotFor(labelIndex("big"), root);
+    const deep = profiler.slotFor(labelIndex("deep"), big);
+    profiler.record(root, 1000, 1000, 1);
+    profiler.record(second, 500, 500, 1);
+    profiler.record(small, 200, 200, 1);
+    profiler.record(big, 600, 600, 1);
+    profiler.record(deep, 100, 100, 1);
+
+    var storage: [16384]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try profiler.writeReport(&writer, .{});
+    const report = writer.buffered();
+    const root_pos = std.mem.indexOf(u8, report, "| report-root").?;
+    const big_pos = std.mem.indexOf(u8, report, "├─ big").?;
+    const deep_pos = std.mem.indexOf(u8, report, "│  └─ deep").?;
+    const small_pos = std.mem.indexOf(u8, report, "└─ small").?;
+    const second_pos = std.mem.indexOf(u8, report, "| report-second").?;
+    try std.testing.expect(root_pos < big_pos and big_pos < deep_pos and deep_pos < small_pos and small_pos < second_pos);
+    for ([_][]const u8{ "66.67%", "40.00%", "13.33%", "6.67%", "33.33%" }) |percent| {
+        try std.testing.expect(std.mem.indexOf(u8, report, percent) != null);
+    }
+    writer = .fixed(&storage);
+    try profiler.writeReport(&writer, .{ .max_rows = 2 });
+    const limited = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, limited, "66.67%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "40.00%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "report-second") == null);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "deep") == null);
+    try std.testing.expect(std.mem.indexOf(u8, limited, "first 2 of 5 zones in tree order") != null);
+}
+
+test "Unicode labels truncate at codepoint boundaries and align by terminal columns" {
+    var buffer: [cell_capacity]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 7), displayWidth("├─ café"));
+    try std.testing.expectEqual(@as(usize, 4), displayWidth("cafe\u{301}"));
+    try std.testing.expectEqual(@as(usize, 4), displayWidth("界面"));
+    const ten = "éééééééééé";
+    const exact = ten ++ ten ++ ten ++ ten;
+    try std.testing.expectEqualStrings(exact, truncateLabel(exact, &buffer));
+    const long = exact ++ "é";
+    try std.testing.expectEqualStrings(ten ++ ten ++ ten ++ "ééééééé...", truncateLabel(long, &buffer));
+    try std.testing.expectEqualStrings("└─ 界界界界界界界界界界界界界界界界界...", truncateParts("└─ ", "界界界界界界界界界界界界界界界界界界界界", &buffer));
+    var storage: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&storage);
+    try writeRowCells(&writer, &.{ 7, 3 }, 1, &.{ "├─ café", "12" });
+    try writeRowCells(&writer, &.{ 7, 3 }, 1, &.{ "界面", "3" });
+    try std.testing.expectEqualStrings("| ├─ café |  12 |\n| 界面    |   3 |\n", writer.buffered());
+}
+
+test "concurrent nested paths merge only under the same parent" {
+    if (!timing_enabled and !memory_enabled) return;
+    var profiler = Profiler.init(std.testing.io, std.heap.smp_allocator);
+    defer profiler.deinit();
+    const main_zone = profiler.zone("thread-parent");
+    var threads: [8]std.Thread = undefined;
+    for (&threads, 0..) |*thread, index| {
+        thread.* = try std.Thread.spawn(.{}, struct {
+            fn run(p: *Profiler, alternate: bool) void {
+                for (0..1000) |_| {
+                    const root = if (alternate) p.zone("concurrent-a") else p.zone("concurrent-b");
+                    const child = p.zone("concurrent-child");
+                    const recursive = p.zone("concurrent-child");
+                    recursive.end();
+                    child.end();
+                    root.end();
+                }
+            }
+        }.run, .{ &profiler, index % 2 == 0 });
+    }
+    for (threads) |thread| thread.join();
+    main_zone.end();
+    for ([_]*const Slot{ labelSlot(&profiler, "concurrent-a"), labelSlot(&profiler, "concurrent-b") }) |root| {
+        try std.testing.expect(root.parent == null);
+        try std.testing.expectEqual(@as(u64, 4000), root.calls());
+        const child = root.children.?;
+        try std.testing.expectEqual(@as(u64, 4000), child.calls());
+        try std.testing.expectEqual(@as(u64, 4000), child.children.?.calls());
+        try std.testing.expect(child.next == null);
+    }
 }
 
 test "a label used at several call sites shares one slot" {

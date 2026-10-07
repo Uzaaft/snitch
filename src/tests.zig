@@ -230,7 +230,7 @@ test "report max rows truncates sorted sections" {
     var report_storage: [8_192]u8 = undefined;
     const report = try writeReportToBuffer(&profiler, &report_storage, .{ .max_rows = 1 });
 
-    const truncation_note = "(showing the top 1 of 2 zones)";
+    const truncation_note = "(showing the first 1 of 2 zones in tree order)";
     try std.testing.expectEqual(@as(usize, 2), countOccurrences(report, truncation_note));
     try expectContains(report, "heavy-zone");
     try expectNotContains(report, "light-zone");

@@ -40,23 +40,31 @@ fn allocationWork(allocator: std.mem.Allocator, size: usize) !u64 {
 }
 
 pub fn main(init: std.process.Init) !void {
+    // Optional row limit: zig build run -Dsnitch=true -- 3
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    const max_rows = if (args.len > 1) try std.fmt.parseInt(usize, args[1], 10) else 0;
     snitch.start(init.io, std.heap.page_allocator);
-    defer snitch.finish(.{});
+    defer snitch.finish(.{ .max_rows = max_rows });
 
     const tracked_allocator = snitch.allocator();
 
     var run_index: usize = 0;
     while (run_index < 2_000) : (run_index += 1) {
+        const frame = snitch.zone("frame");
+        defer frame.end();
         {
             const zone = snitch.zone("busy-loop");
             defer zone.end();
-            _ = busyLoop(600 + run_index);
+            _ = snitch.measureCall("sample", busyLoop, .{600 + run_index});
+            if (run_index == 0) {
+                _ = snitch.measureCall("café-render-with-a-deliberately-long-label-ééé", busyLoop, .{@as(usize, 10)});
+            }
         }
 
         {
             const zone = snitch.zone("alloc-work");
             defer zone.end();
-            _ = try allocationWork(tracked_allocator, 128 + (run_index % 128));
+            _ = try snitch.measureCall("sample", allocationWork, .{ tracked_allocator, 128 + (run_index % 128) });
         }
     }
 

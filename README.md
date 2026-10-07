@@ -82,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
 
 Zones started before `start` or after `finish` are ignored, so libraries can add zones without requiring the application to use snitch.
 
-End every zone before calling `finish`, including zones on other threads. Debug and ReleaseSafe builds panic if one is still open; other builds don't check.
+End each zone exactly once, on its starting thread, in reverse start order within its profiler (normally with `defer zone.end()`). End every zone before calling `finish`, including zones on other threads. Debug and ReleaseSafe builds panic if one is still open; other builds don't check.
 
 ### Separate profilers
 
@@ -114,7 +114,7 @@ The timing and memory flags only matter when `-Dsnitch=true`.
 ```
 [snitch] 2 zones
 
-Timing per call
+Timing per call (inclusive; % Total of root totals)
 +-------------+-------+---------+---------+---------+---------+---------+---------+---------+
 | Zone        | Calls |     Avg |     P50 |     P95 |     P99 |     Max |   Total | % Total |
 +-------------+-------+---------+---------+---------+---------+---------+---------+---------+
@@ -122,7 +122,7 @@ Timing per call
 | busy-loop   | 2,000 | 1.36 us | 1.33 us | 2.34 us | 2.43 us | 4.53 us | 2.72 ms |  29.12% |
 +-------------+-------+---------+---------+---------+---------+---------+---------+---------+
 
-Memory allocated per call
+Memory allocated per call (inclusive; % Total of root totals)
 +-------------+-------+-------+-------+-------+-------+-------+---------+-------------+---------+
 | Zone        | Calls |   Avg |   P50 |   P95 |   P99 |   Max |   Total | Allocs/call | % Total |
 +-------------+-------+-------+-------+-------+-------+-------+---------+-------------+---------+
@@ -130,15 +130,26 @@ Memory allocated per call
 +-------------+-------+-------+-------+-------+-------+-------+---------+-------------+---------+
 ```
 
-The timing table lists every zone. The memory table lists only zones that allocated through the tracked allocator. Both are sorted by `Total`, highest first.
+The timing table lists every zone path. The memory table lists only paths that allocated through the tracked allocator. Parents appear before their children, with roots and siblings sorted by inclusive `Total`, highest first (ties by label). Ordinary Unicode connectors (`├─`, `└─`, `│`) show nesting; no Nerd Font is needed. Labels are capped at 40 terminal columns, including indentation, without splitting UTF-8 characters.
 
-To show only the biggest zones, pass `.{ .max_rows = 20 }` to `finish`, `printReport` or `writeReport`. Each table then shows its top rows and notes how many it left out.
+Timing and memory samples are **inclusive**: a parent's sample includes its children. `% Total` divides each row's total by the sum of **root** totals in that table, not by the sum of nested durations or allocations. Nested percentages therefore overlap; do not sum them. Root timing totals represent measured zone time across threads, not process wall-clock time.
 
-Percentiles come from a fixed-size histogram per label, so memory use stays flat no matter how many times a zone runs. A percentile may read up to 1/64 (about 1.6%) above the true value; averages and totals are exact.
+Repeated calls at the same full parent path share metrics. The same label under different parents, or repeated ancestor labels such as `frame/frame/work`, gets separate metrics. Each profiler and thread has its own active nesting context; children do not inherit zones from another profiler or thread. There are at most 1024 distinct labels, but the number of paths can be larger.
+
+To limit output, pass `.{ .max_rows = 20 }` to `finish`, `printReport` or `writeReport`. Each table shows the first rows in tree order and notes how many it left out. Ancestors are retained, and percentages still use all root totals, including omitted roots.
+
+Render the nested example (including repeated labels under different parents and a long Unicode label):
+
+```sh
+zig build run -Dsnitch=true          # full timing and memory trees on stderr
+zig build run -Dsnitch=true -- 3     # at most three rows per table
+```
+
+Percentiles come from a fixed-size histogram per path, so memory use stays flat no matter how many times an existing path runs. A percentile may read up to 1/64 (about 1.6%) above the true value; averages and totals are exact.
 
 Memory metrics count allocations made through `snitch.allocator()` or `Profiler.allocator()` on the thread that ran the zone, so zones running concurrently on other threads don't pollute each other. End each zone on the thread that started it.
 
-Recording a zone is lock-free and costs about 50 ns, most of it reading the clock twice. Zones much shorter than that are mostly measuring snitch itself.
+Histogram recording and existing-path lookup are lock-free. New paths allocate storage; active nesting uses thread-local inline storage for 16 zones and spills dynamically for deeper stacks, freeing it when the last active zone ends. Very short zones may mostly measure instrumentation overhead.
 
 If snitch is on but both metric groups are off, the report says so instead of printing tables.
 
